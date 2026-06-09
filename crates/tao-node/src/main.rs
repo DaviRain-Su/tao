@@ -481,6 +481,9 @@ fn dag_run(args: DagRunArgs) -> anyhow::Result<()> {
     // accepted).
     let env_blockhash = [7u8; 32];
     let shared = Arc::new(Shared::new(init_accounts, genesis_hash, height0, env_blockhash, None));
+    // Attach the gossip network so RPC-submitted transactions propagate to peers
+    // (any node can then mine them), not just the receiving node.
+    shared.attach_network(network.clone());
     let rpc_thread = if rpc {
         let port = rpc_port.unwrap_or(8899);
         let addr: SocketAddr = format!("0.0.0.0:{port}")
@@ -500,6 +503,8 @@ fn dag_run(args: DagRunArgs) -> anyhow::Result<()> {
     };
 
     let mut pending: Vec<DagBlock> = Vec::new();
+    // Seen-transaction set for gossip dedup (so relayed txs don't loop forever).
+    let mut seen_tx: std::collections::HashSet<[u8; 64]> = std::collections::HashSet::new();
     let mut produced = 0u64;
     let mut last_mine = Instant::now() - Duration::from_millis(block_interval_ms);
     let mut last_log = Instant::now();
@@ -556,16 +561,36 @@ fn dag_run(args: DagRunArgs) -> anyhow::Result<()> {
                     Ok(false) => {}
                     Err(e) => tracing::warn!(error = %e, "snapshot import failed"),
                 },
-                NetMsg::NewTx(_) => {}
+                NetMsg::NewTx(bytes) => {
+                    // Gossip a transaction into the mempool, deduplicated, and
+                    // flood-relay it once so it reaches the whole network (not
+                    // just direct peers).
+                    if let Ok(tx) = bincode::deserialize::<solana_transaction::Transaction>(&bytes) {
+                        if let Some(sig) =
+                            tx.signatures.first().and_then(|s| <[u8; 64]>::try_from(s.as_ref()).ok())
+                        {
+                            if seen_tx.insert(sig) {
+                                shared.submit(tx);
+                                network.broadcast(&NetMsg::NewTx(bytes));
+                            }
+                        }
+                    }
+                }
             }
         }
         // Apply pending blocks, retrying orphans until no further progress.
+        // Newly-accepted peer blocks are flood-relayed so they reach nodes that
+        // aren't our direct peers (multi-hop gossip; receivers dedup by has_block).
+        let mut relay_blocks: Vec<Vec<u8>> = Vec::new();
         loop {
             let mut progress = false;
             let mut still = Vec::new();
             for block in pending.drain(..) {
                 match chain.accept(block.clone()) {
-                    Ok(()) => progress = true,
+                    Ok(()) => {
+                        progress = true;
+                        relay_blocks.push(bincode::serialize(&block).expect("serialize block"));
+                    }
                     Err(e) if e.contains("orphan") => still.push(block),
                     Err(e) if e.contains("pruned") => {}
                     Err(_) => {} // invalid PoW / lowballed difficulty — drop
@@ -575,6 +600,9 @@ fn dag_run(args: DagRunArgs) -> anyhow::Result<()> {
             if !progress {
                 break;
             }
+        }
+        for b in relay_blocks {
+            network.broadcast(&NetMsg::NewBlock(b));
         }
 
         // Backfill: for any still-orphaned block, request its missing ancestors
