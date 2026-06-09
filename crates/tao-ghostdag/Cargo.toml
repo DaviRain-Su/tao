@@ -1,0 +1,11 @@
+[package]
+name = "tao-ghostdag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "GHOSTDAG protocol on the reachability index, ported from rusty-kaspa (ISC)"
+
+[dependencies]
+tao-reachability.workspace = true

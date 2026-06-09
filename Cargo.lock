@@ -3964,6 +3964,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tao-ghostdag"
+version = "0.1.0"
+dependencies = [
+ "tao-reachability",
+]
+
+[[package]]
 name = "tao-mempool"
 version = "0.1.0"
 dependencies = [
