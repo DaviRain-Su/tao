@@ -20,9 +20,16 @@
 //! - **Utility gate**: bind the matrices to a real registered model + inference
 //!   request so the work is genuinely useful (not just "AI-shaped").
 
+mod gemm;
+pub mod utility_gate;
+
 use tao_consensus::{BlockHeader, PowAlgorithm};
 
 /// matmul-PoUW over `n × n` integer matrices with rank-`rank` injected noise.
+///
+/// This is the current "AI-shaped" implementation (matrices derived freely from
+/// the header seed). See the sibling [`utility_gate`] module for the prototype
+/// of binding the work to a real registered model (PLAN.md M7b).
 #[derive(Debug, Clone, Copy)]
 pub struct MatmulPow {
     n: usize,
@@ -40,71 +47,14 @@ impl MatmulPow {
         Self::new(64, 4)
     }
 
-    /// Deterministically expand the seed into `count` signed entries.
-    fn fill(seed: &[u8; 32], domain: u8, count: usize) -> Vec<i64> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(seed);
-        hasher.update(&[domain]);
-        let mut xof = hasher.finalize_xof();
-        let mut bytes = vec![0u8; count];
-        xof.fill(&mut bytes);
-        bytes.into_iter().map(|b| b as i8 as i64).collect()
-    }
-
-    /// Low-rank product `L · Rᵀ` → `rows × cols` (L is rows×rank, R is cols×rank).
-    fn lowrank(l: &[i64], r: &[i64], rows: usize, cols: usize, rank: usize) -> Vec<i64> {
-        let mut out = vec![0i64; rows * cols];
-        for i in 0..rows {
-            for j in 0..cols {
-                let mut acc = 0i64;
-                for k in 0..rank {
-                    acc = acc.wrapping_add(l[i * rank + k].wrapping_mul(r[j * rank + k]));
-                }
-                out[i * cols + j] = acc;
-            }
-        }
-        out
-    }
-
-    /// Dense `n × n` matrix product (wrapping arithmetic for determinism).
-    fn matmul(a: &[i64], b: &[i64], n: usize) -> Vec<i64> {
-        let mut out = vec![0i64; n * n];
-        for i in 0..n {
-            for j in 0..n {
-                let mut acc = 0i64;
-                for k in 0..n {
-                    acc = acc.wrapping_add(a[i * n + k].wrapping_mul(b[k * n + j]));
-                }
-                out[i * n + j] = acc;
-            }
-        }
-        out
-    }
-
-    /// The PoW hash: transcript of the noised product `(A+E)·(B+F)`.
+    /// The PoW hash: transcript of the noised product `(A+E)·(B+F)`, with `A,B`
+    /// (and the noise) derived from the header seed.
     fn compute(&self, header: &BlockHeader) -> [u8; 32] {
         let seed = *blake3::hash(&header.serialize()).as_bytes();
         let (n, r) = (self.n, self.rank);
-
-        let a = Self::fill(&seed, 0, n * n);
-        let b = Self::fill(&seed, 1, n * n);
-        let el = Self::fill(&seed, 2, n * r);
-        let er = Self::fill(&seed, 3, n * r);
-        let fl = Self::fill(&seed, 4, n * r);
-        let fr = Self::fill(&seed, 5, n * r);
-
-        let e = Self::lowrank(&el, &er, n, n, r);
-        let f = Self::lowrank(&fl, &fr, n, n, r);
-        let an: Vec<i64> = a.iter().zip(&e).map(|(x, y)| x.wrapping_add(*y)).collect();
-        let bn: Vec<i64> = b.iter().zip(&f).map(|(x, y)| x.wrapping_add(*y)).collect();
-
-        let cn = Self::matmul(&an, &bn, n);
-
-        let mut hasher = blake3::Hasher::new();
-        for v in &cn {
-            hasher.update(&v.to_le_bytes());
-        }
-        *hasher.finalize().as_bytes()
+        let a = gemm::fill(&seed, 0, n * n);
+        let b = gemm::fill(&seed, 1, n * n);
+        gemm::noisy_product_transcript(&a, &b, n, r, &seed)
     }
 }
 

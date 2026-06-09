@@ -131,6 +131,14 @@ tao balance $(tao address -k wallet.json)
   RandomX→GPU evolution mechanism. *Prototype = CPU integer matmul, verified by
   recomputation.* Production (future) adds GPU CUDA kernels, Plonky2 STARK
   proofs (cheap verify), and a utility gate binding the work to a real model.
+  - **Utility gate** (`tao-pouw::utility_gate`, see [`docs/utility-gate.md`](docs/utility-gate.md)):
+    the design that closes Pearl's open flaw (its network does ≈zero real AI).
+    A model registry commits to weights via a Merkle root; a work item binds
+    (model, tile, input); a valid solution must use the **committed** weight tile
+    (proven by a Merkle proof) and the requested input — the nonce only seeds the
+    noise, so `A·B` is the real inference result. Random/forged matrices are
+    rejected by the Merkle check. Verified by tests (accepts real work + returns
+    `A·B`; rejects the random-matrix attack).
 
 **M0–M6 complete; M7 prototyped.** Remaining (per `docs/PLAN.md`): M7
 production (GPU + ZK + utility gate), M8 — blockDAG/GHOSTDAG; plus networking
