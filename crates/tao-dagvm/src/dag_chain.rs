@@ -36,6 +36,16 @@ fn env_blockhash() -> Blockhash {
     Blockhash::new_from_array([7u8; 32])
 }
 
+/// A durable log record. The log holds an optional leading `Snapshot` (written
+/// by a re-anchor prune) followed by `Block` records for the kept suffix /
+/// subsequently mined blocks. Compaction (`prune`) rewrites it as
+/// `[Snapshot, Block…]`, so at most one snapshot is present and it leads.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum LogRecord {
+    Block(DagBlock),
+    Snapshot { origin_header: DagBlockHeader, accounts: Vec<(Pubkey, AccountSharedData)> },
+}
+
 /// A single-node blockDAG with PoW, persistence, and SVM-executed state.
 pub struct DagChain {
     engine: DagEngine,
@@ -160,11 +170,16 @@ impl DagChain {
             history_pruned: false,
         };
 
-        // Replay the log.
+        // Replay the log: a leading snapshot (from a prune) re-anchors the chain,
+        // then block records are applied on top.
         let records = chain.log.read_all().map_err(|e| e.to_string())?;
         for bytes in records {
-            let block: DagBlock = bincode::deserialize(&bytes).map_err(|e| e.to_string())?;
-            chain.apply(&block)?;
+            match bincode::deserialize::<LogRecord>(&bytes).map_err(|e| e.to_string())? {
+                LogRecord::Snapshot { origin_header, accounts } => {
+                    chain.load_snapshot(origin_header, accounts);
+                }
+                LogRecord::Block(block) => chain.apply(&block)?,
+            }
         }
         Ok(chain)
     }
@@ -267,7 +282,8 @@ impl DagChain {
     /// Mine a block with an explicit header timestamp.
     pub fn mine_at(&mut self, transactions: &[Transaction], timestamp: i64) -> Result<DagBlock, String> {
         let block = self.build_block_at(transactions, timestamp);
-        self.log.append(&bincode::serialize(&block).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let rec = bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?;
+        self.log.append(&rec).map_err(|e| e.to_string())?;
         self.apply(&block)?;
         Ok(block)
     }
@@ -290,7 +306,8 @@ impl DagChain {
         if block.header.target != expected {
             return Err("unexpected difficulty target".into());
         }
-        self.log.append(&bincode::serialize(&block).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let rec = bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?;
+        self.log.append(&rec).map_err(|e| e.to_string())?;
         self.apply(&block)
     }
 
@@ -300,8 +317,24 @@ impl DagChain {
         if self.blocks.contains(&id) {
             return Ok(());
         }
-        let parents: Vec<DagHash> = block.header.parents.iter().map(|p| DagHash::from_bytes(*p)).collect();
-        let parents = if parents.is_empty() { vec![self.genesis_dag] } else { parents };
+        // Map parents to DagHashes, remapping any parent we don't have (a pruned
+        // ancestor) to the current origin, and de-duplicating (preserving order).
+        let genesis_bytes = self.genesis_dag.to_bytes();
+        let mut seen = HashSet::new();
+        let mut parents: Vec<DagHash> = Vec::with_capacity(block.header.parents.len());
+        for p in &block.header.parents {
+            let d = if *p == genesis_bytes || self.blocks.contains(p) {
+                DagHash::from_bytes(*p)
+            } else {
+                self.genesis_dag
+            };
+            if seen.insert(d.to_bytes()) {
+                parents.push(d);
+            }
+        }
+        if parents.is_empty() {
+            parents.push(self.genesis_dag);
+        }
         self.engine.add_block(DagHash::from_bytes(id), &parents);
 
         let txs: Vec<Transaction> = block
@@ -481,6 +514,30 @@ impl DagChain {
         Ok(())
     }
 
+    /// Re-anchor the in-memory chain onto a snapshot origin. Used on replay when
+    /// the log begins with a `Snapshot` record (written by a prior prune).
+    fn load_snapshot(
+        &mut self,
+        origin_header: DagBlockHeader,
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+    ) {
+        let origin = origin_header.id();
+        let origin_dag = DagHash::from_bytes(origin);
+        let engine = DagEngine::new(self.k, origin_dag);
+        engine.add_block(origin_dag, &[blockhash::ORIGIN]);
+        self.engine = engine;
+        self.genesis_dag = origin_dag;
+        self.tips = vec![origin];
+        self.blocks = HashSet::from([origin]);
+        self.headers = HashMap::from([(origin, origin_header)]);
+        self.block_txs.clear();
+        self.base_accounts = Some(accounts);
+        self.history_pruned = true;
+        self.checkpoint = None;
+        self.state = None;
+        self.executed.clear();
+    }
+
     /// Prune the transaction bodies of finalized blocks (those in the checkpoint
     /// prefix). Their effects are already captured in the checkpoint snapshot, so
     /// they are redundant for state; dropping them bounds the dominant memory
@@ -596,6 +653,26 @@ impl DagChain {
         self.blocks = kept;
         self.state = None;
         self.executed.clear();
+
+        // Compact the durable log so the prune survives a restart: a leading
+        // snapshot (origin header + base accounts) followed by the kept suffix.
+        let p_header = self.headers.get(&p).cloned().expect("origin header retained");
+        let base = self.base_accounts.clone().expect("base set above");
+        let mut records: Vec<Vec<u8>> = Vec::with_capacity(n - p_idx);
+        records.push(
+            bincode::serialize(&LogRecord::Snapshot { origin_header: p_header, accounts: base })
+                .map_err(|e| BankError::Storage(e.to_string()))?,
+        );
+        for id in &order[p_idx + 1..] {
+            if let Some(block) = self.get_block(id) {
+                records.push(
+                    bincode::serialize(&LogRecord::Block(block))
+                        .map_err(|e| BankError::Storage(e.to_string()))?,
+                );
+            }
+        }
+        self.log.replace_all(&records).map_err(|e| BankError::Storage(e.to_string()))?;
+
         Ok(pruned_count)
     }
 
@@ -1010,6 +1087,65 @@ mod tests {
         let r1 = chain.virtual_state().unwrap().state_root().unwrap();
         let r2 = chain.rebuild_state().unwrap().state_root().unwrap();
         assert_eq!(r1, r2, "post-prune mining keeps virtual == rebuild");
+    }
+
+    #[test]
+    fn pruning_persists_across_restart() {
+        // After a re-anchor prune, the compacted log must reproduce the pruned
+        // chain on restart — same blocks, order, and state (not the full history).
+        let payer = solana_keypair::Keypair::new();
+        let a = solana_keypair::Keypair::new();
+        let miner = Pubkey::new_unique();
+        let d = dir("prune-restart");
+        let open = |d: &PathBuf| {
+            let mut c = DagChain::open_with_daa(
+                d.clone(),
+                3,
+                easy_target(),
+                miner,
+                1_000_000,
+                vec![(payer.pubkey(), 1_000_000_000)],
+                10,
+                5,
+            )
+            .unwrap();
+            c.set_finality_depth(2);
+            c
+        };
+
+        let (post_root, post_order, post_blocks) = {
+            let mut chain = open(&d);
+            let mut ts = 1_000_000i64;
+            for i in 0..24 {
+                let txs = if i < 3 {
+                    vec![transfer(&payer, &a.pubkey(), 20_000_000)]
+                } else {
+                    vec![]
+                };
+                chain.mine_at(&txs, ts).unwrap();
+                ts += 10;
+                chain.virtual_state().unwrap();
+            }
+            assert!(chain.prune().unwrap() > 0);
+            let root = chain.virtual_state().unwrap().state_root().unwrap();
+            (root, chain.total_order(), chain.block_count())
+        };
+
+        // Restart: reopen the same data dir; the compacted log re-anchors.
+        let mut reopened = open(&d);
+        assert!(reopened.is_history_pruned(), "restart restores pruned state");
+        assert_eq!(reopened.block_count(), post_blocks, "only the kept suffix is reloaded");
+        assert_eq!(reopened.total_order(), post_order, "order reproduced after restart");
+        assert_eq!(
+            reopened.virtual_state().unwrap().state_root().unwrap(),
+            post_root,
+            "state reproduced after restart"
+        );
+        // And it keeps working: mine on top.
+        reopened.mine_at(&[transfer(&payer, &a.pubkey(), 1_000_000)], 2_000_000).unwrap();
+        let v = reopened.virtual_state().unwrap().state_root().unwrap();
+        let r = reopened.rebuild_state().unwrap().state_root().unwrap();
+        assert_eq!(v, r, "post-restart mining stays consistent");
     }
 
     #[test]

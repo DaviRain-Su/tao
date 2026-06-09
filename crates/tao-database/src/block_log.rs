@@ -44,6 +44,31 @@ impl BlockLog {
         Ok(())
     }
 
+    /// Atomically replace the entire log with `records` (compaction). Writes a
+    /// temp file and renames it over the log, so a crash leaves either the old
+    /// or the new log intact, never a partial one. The internal writer is
+    /// repointed at the compacted file for subsequent appends.
+    pub fn replace_all(&self, records: &[Vec<u8>]) -> Result<()> {
+        let tmp = self.path.with_extension("log.compact");
+        {
+            let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+            for payload in records {
+                let len: u32 = payload
+                    .len()
+                    .try_into()
+                    .map_err(|_| TaoError::Storage("block too large for log record".into()))?;
+                f.write_all(&len.to_be_bytes())?;
+                f.write_all(payload)?;
+            }
+            f.flush()?;
+        }
+        let mut writer = self.writer.lock().expect("block log mutex poisoned");
+        std::fs::rename(&tmp, &self.path)?;
+        // Repoint the append handle at the compacted file.
+        *writer = OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        Ok(())
+    }
+
     /// Read every record in order. Returns the raw payloads (block bytes).
     pub fn read_all(&self) -> Result<Vec<Vec<u8>>> {
         let file = File::open(&self.path)?;
