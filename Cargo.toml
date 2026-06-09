@@ -53,13 +53,14 @@ ctrlc = { version = "3", features = ["termination"] }
 rocksdb = "0.24"
 
 # ---- solana ecosystem (compat layer) ----
-# Versions pinned to solana-svm 4.0.0's dependency tree (see docs/svm-integration-4.0.md):
-# svm 4.0 itself is 4.x but depends on the 3.x line of account/transaction/message.
-# Mixing 4.x of those would create duplicate incompatible AccountSharedData types.
-solana-pubkey = { version = "=4.1.0", features = ["serde"] }
-solana-hash = { version = "=4.2.0", features = ["serde"] }
-solana-account = { version = "=3.4.0", features = ["serde"] }
-solana-sdk-ids = "=3.1.0"
+# Loose (major-version) pins so the resolver can find ONE consistent set with the
+# solana-svm 4.0 tree (which constrains solana-pubkey to ~4.1). svm 4.0 itself is
+# 4.x but pulls the 3.x line of account/transaction/message; do not force 4.x there.
+# See docs/svm-integration-4.0.md. Verify single copies with `cargo tree -d`.
+solana-pubkey = { version = "4", features = ["serde"] }
+solana-hash = { version = "4", features = ["serde"] }
+solana-account = { version = "3", features = ["serde"] }
+solana-sdk-ids = "3"
 
 [profile.release]
 opt-level = 3

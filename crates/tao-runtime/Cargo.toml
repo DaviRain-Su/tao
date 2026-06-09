@@ -12,7 +12,34 @@ tao-core.workspace = true
 tao-database.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+bincode.workspace = true
+serde.workspace = true
 solana-pubkey.workspace = true
 solana-account.workspace = true
 solana-hash.workspace = true
 solana-sdk-ids.workspace = true
+
+# ---- solana-svm 4.0 execution stack (see docs/svm-integration-4.0.md) ----
+# SVM crates pinned exact to 4.0.0; everything else loose so the resolver unifies.
+# NOTE: 4.0.0 hides the standalone-SVM API behind the `agave-unstable-api` feature
+# (the whole crate is `#![cfg(feature = "agave-unstable-api")]`), so enable it.
+solana-svm = { version = "=4.0.0", features = ["dev-context-only-utils", "agave-unstable-api"] }
+solana-svm-callback = { version = "=4.0.0", features = ["agave-unstable-api"] }
+solana-svm-feature-set = "=4.0.0"
+solana-program-runtime = { version = "=4.0.0", features = ["agave-unstable-api"] }
+solana-compute-budget = { version = "=4.0.0", features = ["agave-unstable-api"] }
+solana-system-program = { version = "=4.0.0", features = ["agave-unstable-api"] }
+solana-sbpf = "0.14"
+solana-clock = "3"
+solana-rent = "3"
+solana-epoch-schedule = "3"
+solana-fee-structure = "3"
+solana-transaction = { version = "3", features = ["dev-context-only-utils"] }
+solana-message = "3"
+solana-transaction-error = "3"
+solana-instruction = "3"
+
+[dev-dependencies]
+solana-keypair = "3"
+solana-signer = "3"
+solana-system-interface = { version = "3", features = ["bincode"] }
