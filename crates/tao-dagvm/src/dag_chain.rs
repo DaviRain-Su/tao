@@ -19,57 +19,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
 use solana_account::AccountSharedData;
 use solana_hash::Hash as Blockhash;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use tao_consensus::{
-    meets_target, next_target, tx_merkle_root, BlockHeader as ConsHeader, DifficultyParams, Target,
+    meets_target, next_target, tx_merkle_root, BlockHeader as ConsHeader, DagBlock, DagBlockHeader,
+    DifficultyParams, Target, HEADER_VERSION,
 };
 use tao_database::{AccountsDb, BlockLog};
 use tao_ghostdag::{blockhash, DagEngine, Hash as DagHash};
 use tao_runtime::{Bank, BankError};
 
-const HEADER_VERSION: u32 = 1;
 /// Fixed env blockhash for SVM execution (does not affect state for plain transfers).
 fn env_blockhash() -> Blockhash {
     Blockhash::new_from_array([7u8; 32])
-}
-
-/// A multi-parent blockDAG header.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct DagBlockHeader {
-    pub version: u32,
-    pub parents: Vec<[u8; 32]>,
-    pub timestamp: i64,
-    pub tx_merkle_root: [u8; 32],
-    pub target: [u8; 32],
-    pub nonce: u64,
-    pub miner: [u8; 32],
-}
-
-impl DagBlockHeader {
-    fn serialize(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("header serialization is infallible")
-    }
-    /// Block id = BLAKE3 of the header (also the PoW hash for this Blake3 PoW).
-    pub fn id(&self) -> [u8; 32] {
-        *blake3::hash(&self.serialize()).as_bytes()
-    }
-}
-
-/// A DAG block: header + serialized transactions.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct DagBlock {
-    pub header: DagBlockHeader,
-    pub transactions: Vec<Vec<u8>>,
-}
-
-impl DagBlock {
-    pub fn id(&self) -> [u8; 32] {
-        self.header.id()
-    }
 }
 
 /// A single-node blockDAG with PoW, persistence, and SVM-executed state.
@@ -149,10 +113,11 @@ impl DagChain {
             version: HEADER_VERSION,
             parents: vec![],
             timestamp: 1_750_000_000,
-            tx_merkle_root: [0u8; 32],
+            tx_merkle_root: Blockhash::default(),
+            state_root: Blockhash::default(),
             target: genesis_target,
             nonce: 0,
-            miner: [0u8; 32],
+            miner: Pubkey::default(),
         };
         let genesis_id = genesis_header.id();
         let genesis_dag = DagHash::from_bytes(genesis_id);
@@ -272,10 +237,11 @@ impl DagChain {
             version: HEADER_VERSION,
             parents: self.tips.clone(),
             timestamp,
-            tx_merkle_root: tx_merkle_root(&serialized).to_bytes(),
+            tx_merkle_root: tx_merkle_root(&serialized),
+            state_root: Blockhash::default(),
             target,
             nonce: 0,
-            miner: self.miner.to_bytes(),
+            miner: self.miner,
         };
         while !meets_target(&header.id(), &target) {
             header.nonce = header.nonce.wrapping_add(1);
@@ -774,10 +740,11 @@ mod tests {
             version: HEADER_VERSION,
             parents: vec![parent],
             timestamp: 9_000_000,
-            tx_merkle_root: tx_merkle_root(&[]).to_bytes(),
+            tx_merkle_root: tx_merkle_root(&[]),
+            state_root: Blockhash::default(),
             target,
             nonce: 0,
-            miner: miner.to_bytes(),
+            miner,
         };
         while !meets_target(&h.id(), &target) {
             h.nonce = h.nonce.wrapping_add(1);

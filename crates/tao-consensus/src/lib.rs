@@ -17,7 +17,9 @@ pub mod mine;
 pub mod pow;
 pub mod target;
 
-pub use block::{tx_merkle_root, Block, BlockHeader, BlockId, HEADER_VERSION};
+pub use block::{
+    tx_merkle_root, Block, BlockHeader, BlockId, DagBlock, DagBlockHeader, HEADER_VERSION,
+};
 pub use chain::{BlockStatus, ChainError, ChainState};
 pub use difficulty::{next_target, DifficultyParams};
 pub use genesis::genesis_header;

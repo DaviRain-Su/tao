@@ -82,6 +82,63 @@ impl Block {
     }
 }
 
+/// blockDAG header — the M8 multi-parent generalization of [`BlockHeader`].
+///
+/// It shares the linear header's identity/PoW hashing scheme (BLAKE3 over the
+/// bincode-encoded header) and field types, replacing the single `prev_hash`
+/// with a set of GHOSTDAG `parents` and dropping the linear `height` (a DAG
+/// block's position is its GHOSTDAG blue score, not a scalar height).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DagBlockHeader {
+    /// Header format version.
+    pub version: u32,
+    /// Parent block ids (the GHOSTDAG parents). Empty only for genesis.
+    pub parents: Vec<BlockId>,
+    /// Block timestamp (unix seconds).
+    pub timestamp: i64,
+    /// Merkle root over the block's transactions.
+    pub tx_merkle_root: Hash,
+    /// Commitment to post-execution account state. Reserved: the DAG keeps state
+    /// as a derived cache (see `tao-dagvm`), so it is left zero for now.
+    pub state_root: Hash,
+    /// PoW target threshold (big-endian). `pow_hash <= target` wins.
+    pub target: Target,
+    /// PoW solution nonce.
+    pub nonce: u64,
+    /// Address that receives this block's coinbase reward.
+    pub miner: Pubkey,
+}
+
+impl DagBlockHeader {
+    /// Serialize the header deterministically (bincode) for hashing and storage.
+    pub fn serialize(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("header serialization is infallible")
+    }
+
+    /// The block id = BLAKE3 of the serialized header (also the PoW hash for the
+    /// Blake3 PoW). Same scheme as [`BlockHeader::id`].
+    pub fn id(&self) -> BlockId {
+        *blake3::hash(&self.serialize()).as_bytes()
+    }
+}
+
+/// A full blockDAG block: a multi-parent header plus serialized transactions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DagBlock {
+    pub header: DagBlockHeader,
+    pub transactions: Vec<Vec<u8>>,
+}
+
+impl DagBlock {
+    pub fn new(header: DagBlockHeader, transactions: Vec<Vec<u8>>) -> Self {
+        Self { header, transactions }
+    }
+
+    pub fn id(&self) -> BlockId {
+        self.header.id()
+    }
+}
+
 /// Compute a transaction Merkle root (BLAKE3) over serialized transactions.
 ///
 /// Empty blocks hash to a fixed all-zero root. Odd levels duplicate the last

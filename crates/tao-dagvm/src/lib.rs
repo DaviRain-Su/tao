@@ -11,7 +11,10 @@
 //! a blockDAG unchanged.
 
 mod dag_chain;
-pub use dag_chain::{DagBlock, DagBlockHeader, DagChain};
+pub use dag_chain::DagChain;
+// The DAG block types now live in the consensus layer (unified with the linear
+// header); re-exported here for convenience.
+pub use tao_consensus::{DagBlock, DagBlockHeader};
 
 use std::collections::HashMap;
 use std::sync::Arc;
