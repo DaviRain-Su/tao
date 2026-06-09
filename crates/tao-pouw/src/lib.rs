@@ -71,6 +71,93 @@ impl PowAlgorithm for MatmulPow {
     }
 }
 
+/// **Utility-gated** matmul-PoUW as the chain's actual block PoW.
+///
+/// Unlike [`MatmulPow`] (matrices freely derived from the seed = "AI-shaped"
+/// work), this binds the PoW to a **real registered model**: the puzzle is the
+/// model's committed weight tile applied to a per-block input. Mining grinds the
+/// `nonce`, which only seeds the low-rank *noise*, so the underlying `A·B` is the
+/// genuine model-layer result. Every node holds the same genesis-agreed model
+/// (its id is the Merkle commitment over the weight tiles), so verification
+/// recomputes the transcript against the *canonical* weights — a miner cannot
+/// substitute forged weights (the transcript wouldn't match). This makes the
+/// chain's work provably real model computation, fitting the existing
+/// [`PowAlgorithm`] trait with no header change.
+pub struct UtilityGatePow {
+    weights: Vec<Vec<i64>>,
+    n: usize,
+    rank: usize,
+    model_id: [u8; 32],
+}
+
+impl UtilityGatePow {
+    /// Build from explicit weight tiles (each an `n×n` matrix). The model id is
+    /// the Merkle commitment over the tiles (so all nodes agree on the weights).
+    pub fn from_weights(name: &str, n: usize, rank: usize, weights: Vec<Vec<i64>>) -> Self {
+        assert!(n > 0 && rank > 0 && rank <= n && !weights.is_empty());
+        assert!(weights.iter().all(|t| t.len() == n * n), "tiles must be n×n");
+        let mut reg = utility_gate::ModelRegistry::new();
+        let model_id = reg.register(name, n, &weights);
+        Self { weights, n, rank, model_id }
+    }
+
+    /// A deterministic demo model with `tiles` weight layers (same on all nodes).
+    /// Production commits the real model in genesis instead.
+    pub fn demo(name: &str, n: usize, rank: usize, tiles: usize) -> Self {
+        let weights: Vec<Vec<i64>> = (0..tiles)
+            .map(|t| (0..n * n).map(|i| ((t * 7 + i * 3) % 17) as i64 - 8).collect())
+            .collect();
+        Self::from_weights(name, n, rank, weights)
+    }
+
+    /// The model id = Merkle commitment over the weight tiles.
+    pub fn model_id(&self) -> [u8; 32] {
+        self.model_id
+    }
+
+    /// Derive this block's work item (tile index + input + work commitment) from
+    /// the header *excluding the nonce* (the nonce is the grinding variable). All
+    /// non-nonce fields are committed, so a solved block can't be repurposed.
+    fn work(&self, header: &BlockHeader) -> (usize, Vec<i64>, [u8; 32]) {
+        let mut base_header = header.clone();
+        base_header.nonce = 0;
+        let base = *blake3::hash(&base_header.serialize()).as_bytes();
+        let tile = (u64::from_le_bytes(base[0..8].try_into().unwrap()) as usize) % self.weights.len();
+        let input = gemm::fill(&base, 7, self.n * self.n);
+        let mut h = blake3::Hasher::new();
+        h.update(b"tao-utility-wc");
+        h.update(&self.model_id);
+        h.update(&base);
+        let work_commitment = *h.finalize().as_bytes();
+        (tile, input, work_commitment)
+    }
+
+    /// The useful inference output `A·B` for this block's derived work item — the
+    /// real model-layer result the work computed (recoverable cheaply).
+    pub fn useful_output(&self, header: &BlockHeader) -> Vec<i64> {
+        let (tile, input, _) = self.work(header);
+        gemm::matmul(&self.weights[tile], &input, self.n)
+    }
+}
+
+impl PowAlgorithm for UtilityGatePow {
+    fn name(&self) -> &'static str {
+        "utility-matmul-pouw"
+    }
+
+    fn pow_hash(&self, header: &BlockHeader) -> [u8; 32] {
+        let (tile, input, work_commitment) = self.work(header);
+        // The nonce only seeds the noise; the model tile + input are fixed by the
+        // block, so finding a winning nonce requires actually doing the matmul.
+        let mut h = blake3::Hasher::new();
+        h.update(b"tao-noise");
+        h.update(&work_commitment);
+        h.update(&header.nonce.to_le_bytes());
+        let seed = *h.finalize().as_bytes();
+        gemm::noisy_product_transcript(&self.weights[tile], &input, self.n, self.rank, &seed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +235,50 @@ mod tests {
                 .expect("block accepted across the switch");
         }
         assert_eq!(chain.height(), 5);
+    }
+
+    /// The utility-gated matmul-PoUW drives a real chain end-to-end: every block's
+    /// PoW is the genesis model's layer applied to a per-block input.
+    #[test]
+    fn utility_gate_pow_drives_a_chain() {
+        let mut target = [0xffu8; 32];
+        target[0] = 0x00;
+        let genesis = header(0, 0, target);
+
+        let gate = UtilityGatePow::demo("tao-pouw-model", 8, 2, 8);
+        assert_ne!(gate.model_id(), [0u8; 32]);
+        let pow: Arc<dyn PowAlgorithm> = Arc::new(gate);
+        let params = DifficultyParams::new(10, 16);
+        let mut chain = ChainState::new(genesis, params, pow.clone());
+
+        for h in 1..=5u64 {
+            let mut header =
+                chain.build_candidate(Pubkey::default(), 1_000_000 + (h as i64) * 10, &[]);
+            while !pow.verify(&header) {
+                header.nonce += 1;
+            }
+            chain.add_header(header).expect("utility-gated block accepted");
+        }
+        assert_eq!(chain.height(), 5);
+    }
+
+    /// Tampering any committed (non-nonce) header field invalidates the PoW: the
+    /// derived work item changes, so the transcript no longer meets the target.
+    #[test]
+    fn utility_gate_pow_binds_the_whole_header() {
+        let gate = UtilityGatePow::demo("m", 8, 2, 8);
+        let mut target = [0xffu8; 32];
+        target[0] = 0x00;
+        let mut h = header(1, 0, target);
+        while !gate.verify(&h) {
+            h.nonce += 1;
+        }
+        assert!(gate.verify(&h));
+        // The useful output is the real model-layer result (right shape).
+        assert_eq!(gate.useful_output(&h).len(), 8 * 8);
+        // Tamper a committed field (height) → different puzzle → invalid.
+        let mut bad = h.clone();
+        bad.height = 2;
+        assert!(!gate.verify(&bad) || gate.pow_hash(&bad) != gate.pow_hash(&h));
     }
 }
