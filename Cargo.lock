@@ -3551,9 +3551,11 @@ dependencies = [
 name = "tao-runtime"
 version = "0.1.0"
 dependencies = [
+ "agave-syscalls",
  "bincode",
  "serde",
  "solana-account",
+ "solana-bpf-loader-program",
  "solana-clock",
  "solana-compute-budget",
  "solana-epoch-schedule",

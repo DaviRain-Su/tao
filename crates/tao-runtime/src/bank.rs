@@ -13,10 +13,8 @@ use solana_clock::{Clock, Epoch, Slot};
 use solana_compute_budget::compute_budget_limits::ComputeBudgetLimits;
 use solana_fee_structure::FeeDetails;
 use solana_hash::Hash;
-use solana_program_runtime::loaded_programs::{
-    BlockRelation, ForkGraph, ProgramCacheEntry,
-};
-use solana_program_runtime::solana_sbpf::{program::BuiltinProgram, vm::Config as VmConfig};
+use solana_program_runtime::execution_budget::SVMTransactionExecutionBudget;
+use solana_program_runtime::loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry};
 use solana_pubkey::Pubkey;
 use solana_svm::account_loader::CheckedTransactionDetails;
 use solana_svm::transaction_processing_result::ProcessedTransaction;
@@ -104,12 +102,24 @@ impl Bank {
     pub fn new(db: Arc<AccountsDb>, slot: Slot) -> Self {
         let epoch: Epoch = 0;
         let fork_graph = Arc::new(RwLock::new(TaoForkGraph));
+        let feature_set = SVMFeatureSet::all_enabled();
+
+        // The v1 program-runtime environment registers all standard syscalls so
+        // real sBPF programs (SPL Token, Anchor, ...) verify and execute.
+        let budget = SVMTransactionExecutionBudget::default();
+        let loader = agave_syscalls::create_program_runtime_environment_v1(
+            &feature_set,
+            &budget,
+            false, // reject_deployment_of_broken_elfs
+            false, // debugging_features
+        )
+        .expect("create v1 program runtime environment");
 
         let processor = TransactionBatchProcessor::<TaoForkGraph>::new(
             slot,
             epoch,
             Arc::downgrade(&fork_graph),
-            Some(Arc::new(BuiltinProgram::new_loader(VmConfig::default()))),
+            Some(Arc::new(loader)),
             None,
         );
 
@@ -119,10 +129,11 @@ impl Bank {
             _fork_graph: fork_graph,
             slot,
             epoch,
-            feature_set: SVMFeatureSet::all_enabled(),
+            feature_set,
         };
         bank.install_sysvars();
         bank.register_system_builtin();
+        bank.register_loader_builtins();
         bank
     }
 
@@ -173,6 +184,53 @@ impl Bank {
                 solana_system_program::system_processor::Entrypoint::vm,
             ),
         );
+    }
+
+    /// Register the BPF loader builtins so programs owned by them can execute.
+    fn register_loader_builtins(&self) {
+        let loaders = [
+            (solana_sdk_ids::bpf_loader::id(), "solana_bpf_loader_program"),
+            (solana_sdk_ids::bpf_loader_deprecated::id(), "solana_bpf_loader_deprecated_program"),
+            (solana_sdk_ids::bpf_loader_upgradeable::id(), "solana_bpf_loader_upgradeable_program"),
+        ];
+        for (id, name) in loaders {
+            let account = AccountSharedData::from(Account {
+                lamports: 1,
+                data: name.as_bytes().to_vec(),
+                owner: solana_sdk_ids::native_loader::id(),
+                executable: true,
+                rent_epoch: 0,
+            });
+            let _ = self.db.set(&id, &account);
+            self.processor.add_builtin(
+                id,
+                ProgramCacheEntry::new_builtin(
+                    0,
+                    name.len(),
+                    solana_bpf_loader_program::Entrypoint::vm,
+                ),
+            );
+        }
+    }
+
+    /// Deploy an sBPF program (a `.so` ELF) at `program_id` as a non-upgradeable
+    /// (`bpf_loader` v2) executable account. The SVM JIT-compiles it on first
+    /// use. This is how SPL Token / Anchor programs get onto the chain.
+    pub fn deploy_program(&self, program_id: &Pubkey, elf: &[u8]) -> Result<(), BankError> {
+        let lamports = self.rent_exempt_minimum(elf.len()).max(1);
+        let account = AccountSharedData::from(Account {
+            lamports,
+            data: elf.to_vec(),
+            owner: solana_sdk_ids::bpf_loader::id(),
+            executable: true,
+            rent_epoch: 0,
+        });
+        self.db.set(program_id, &account).map_err(|e| BankError::Storage(e.to_string()))
+    }
+
+    /// Rent-exempt minimum balance for an account of `space` bytes.
+    pub fn rent_exempt_minimum(&self, space: usize) -> u64 {
+        solana_rent::Rent::default().minimum_balance(space)
     }
 
     /// Latest account-set state root (delegated to the store).
@@ -457,6 +515,117 @@ mod tests {
         let (exec_b, miner_b, _) = run("blk_b");
         assert_eq!(exec_a.state_root, exec_b.state_root, "non-deterministic state root");
         assert_eq!(miner_a, miner_b);
+    }
+
+    // ---- SPL Token: real sBPF program execution ----
+
+    use solana_instruction::{AccountMeta, Instruction};
+    use std::str::FromStr;
+
+    /// The real, mainnet SPL Token program binary (v3.5.0), deployed on-chain.
+    const SPL_TOKEN_ELF: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../programs/spl_token.so"));
+
+    fn spl_token_id() -> Pubkey {
+        Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap()
+    }
+
+    // Minimal SPL Token instruction encoders (avoid a spl-token crate dep that
+    // would fight our locked solana versions). Tags per spl-token 3.x.
+    fn ix_initialize_mint2(token: &Pubkey, mint: &Pubkey, authority: &Pubkey, decimals: u8) -> Instruction {
+        let mut data = vec![20u8, decimals]; // InitializeMint2
+        data.extend_from_slice(authority.as_ref());
+        data.push(0); // freeze authority COption::None
+        Instruction { program_id: *token, accounts: vec![AccountMeta::new(*mint, false)], data }
+    }
+
+    fn ix_initialize_account3(token: &Pubkey, account: &Pubkey, mint: &Pubkey, owner: &Pubkey) -> Instruction {
+        let mut data = vec![18u8]; // InitializeAccount3
+        data.extend_from_slice(owner.as_ref());
+        Instruction {
+            program_id: *token,
+            accounts: vec![AccountMeta::new(*account, false), AccountMeta::new_readonly(*mint, false)],
+            data,
+        }
+    }
+
+    fn ix_mint_to(token: &Pubkey, mint: &Pubkey, dest: &Pubkey, authority: &Pubkey, amount: u64) -> Instruction {
+        let mut data = vec![7u8]; // MintTo
+        data.extend_from_slice(&amount.to_le_bytes());
+        Instruction {
+            program_id: *token,
+            accounts: vec![
+                AccountMeta::new(*mint, false),
+                AccountMeta::new(*dest, false),
+                AccountMeta::new_readonly(*authority, true),
+            ],
+            data,
+        }
+    }
+
+    #[test]
+    fn deploys_and_runs_spl_token() {
+        let db = tmp_db("spl");
+        let payer = Keypair::new();
+        let mint = Keypair::new();
+        let token_account = Keypair::new();
+        fund(&db, &payer.pubkey(), 1_000_000_000);
+
+        let bank = Bank::new(db.clone(), 1);
+        let token = spl_token_id();
+        bank.deploy_program(&token, SPL_TOKEN_ELF).unwrap();
+
+        let blockhash = Hash::new_unique();
+        let mint_rent = bank.rent_exempt_minimum(82);
+        let acct_rent = bank.rent_exempt_minimum(165);
+
+        // 1) Create + initialize the mint (decimals = 0).
+        let tx1 = Transaction::new_signed_with_payer(
+            &[
+                solana_system_interface::instruction::create_account(
+                    &payer.pubkey(), &mint.pubkey(), mint_rent, 82, &token,
+                ),
+                ix_initialize_mint2(&token, &mint.pubkey(), &payer.pubkey(), 0),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &mint],
+            blockhash,
+        );
+        let o1 = bank.execute_transaction(&tx1, blockhash).unwrap();
+        assert!(o1.succeeded, "create+init mint failed: {:?}", o1.error);
+
+        // 2) Create + initialize a token account owned by the payer.
+        let tx2 = Transaction::new_signed_with_payer(
+            &[
+                solana_system_interface::instruction::create_account(
+                    &payer.pubkey(), &token_account.pubkey(), acct_rent, 165, &token,
+                ),
+                ix_initialize_account3(&token, &token_account.pubkey(), &mint.pubkey(), &payer.pubkey()),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &token_account],
+            blockhash,
+        );
+        let o2 = bank.execute_transaction(&tx2, blockhash).unwrap();
+        assert!(o2.succeeded, "create+init token account failed: {:?}", o2.error);
+
+        // 3) Mint 1_000_000 tokens to the token account.
+        let amount = 1_000_000u64;
+        let tx3 = Transaction::new_signed_with_payer(
+            &[ix_mint_to(&token, &mint.pubkey(), &token_account.pubkey(), &payer.pubkey(), amount)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            blockhash,
+        );
+        let o3 = bank.execute_transaction(&tx3, blockhash).unwrap();
+        assert!(o3.succeeded, "mint_to failed: {:?}", o3.error);
+
+        // Verify: SPL token account `amount` field is at byte offset 64..72.
+        let acct = db.get(&token_account.pubkey()).unwrap().unwrap();
+        let data = acct.data();
+        assert_eq!(data.len(), 165, "token account size");
+        let balance = u64::from_le_bytes(data[64..72].try_into().unwrap());
+        assert_eq!(balance, amount, "SPL token balance after mint_to");
     }
 
     #[test]

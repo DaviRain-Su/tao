@@ -29,6 +29,8 @@ solana-svm-feature-set = "=4.0.0"
 solana-program-runtime = { version = "=4.0.0", features = ["agave-unstable-api"] }
 solana-compute-budget = { version = "=4.0.0", features = ["agave-unstable-api"] }
 solana-system-program = { version = "=4.0.0", features = ["agave-unstable-api"] }
+solana-bpf-loader-program = { version = "=4.0.0", features = ["agave-unstable-api"] }
+agave-syscalls = { version = "=4.0.0", features = ["agave-unstable-api"] }
 solana-sbpf = "0.14"
 solana-clock = "3"
 solana-rent = "3"

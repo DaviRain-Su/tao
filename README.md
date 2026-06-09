@@ -69,8 +69,15 @@ cargo run -p tao-node -- run --mine \
   --miner So11111111111111111111111111111111111111112 --data-dir .tao --blocks 5
 ```
 
-Next: **M3** (deploy SPL Token + run an Anchor program) and **M4**
-(Solana-compatible JSON-RPC so Phantom / web3.js can submit transactions).
+- **M3 — SPL Token + program deployment ✓ (core)** The Bank registers a real
+  syscall loader (`agave-syscalls`) and the BPF loader builtins, and can
+  `deploy_program` an sBPF `.so`. Proven: the **real mainnet SPL Token program**
+  (`programs/spl_token.so`) is deployed and executed end-to-end — create +
+  initialize a mint, initialize a token account, `MintTo`, and the token
+  balance reads back correctly. Anchor programs run via the same path. 32 tests.
+
+Next: **M4** (Solana-compatible JSON-RPC so Phantom / web3.js can submit
+transactions) and **M5** (P2P networking + mempool).
 
 ## License
 
