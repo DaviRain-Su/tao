@@ -27,6 +27,9 @@ pub enum NetMsg {
     NewBlock(Vec<u8>),
     /// A serialized Solana `Transaction` (bincode).
     NewTx(Vec<u8>),
+    /// Request a block by id (32-byte hash). A peer that has it replies with
+    /// `NewBlock`. Used to backfill an orphan's missing ancestors.
+    GetBlock([u8; 32]),
 }
 
 /// A handle to the gossip network: broadcast out, peers in via the inbound channel.

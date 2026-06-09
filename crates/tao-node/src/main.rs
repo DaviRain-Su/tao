@@ -226,14 +226,26 @@ fn dag_run(
     let mut produced = 0u64;
     let mut last_mine = Instant::now() - Duration::from_millis(block_interval_ms);
     let mut last_log = Instant::now();
+    let mut last_request = Instant::now() - Duration::from_secs(1);
 
     tracing::info!(%listen, miner = %miner_pubkey, "blockDAG node started");
 
     while !shutdown.load(Ordering::Relaxed) {
-        // Receive gossiped blocks.
-        while let Ok(NetMsg::NewBlock(bytes)) = rx.try_recv() {
-            if let Ok(block) = bincode::deserialize::<DagBlock>(&bytes) {
-                pending.push(block);
+        // Drain inbound: buffer announced blocks, serve backfill requests.
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                NetMsg::NewBlock(bytes) => {
+                    if let Ok(block) = bincode::deserialize::<DagBlock>(&bytes) {
+                        pending.push(block);
+                    }
+                }
+                NetMsg::GetBlock(id) => {
+                    if let Some(block) = chain.get_block(&id) {
+                        let bytes = bincode::serialize(&block).expect("serialize block");
+                        network.broadcast(&NetMsg::NewBlock(bytes));
+                    }
+                }
+                NetMsg::NewTx(_) => {}
             }
         }
         // Apply pending blocks, retrying orphans until no further progress.
@@ -244,13 +256,30 @@ fn dag_run(
                 match chain.accept(block.clone()) {
                     Ok(()) => progress = true,
                     Err(e) if e.contains("orphan") => still.push(block),
-                    Err(_) => {} // invalid PoW etc — drop
+                    Err(_) => {} // invalid PoW / lowballed difficulty — drop
                 }
             }
             pending = still;
             if !progress {
                 break;
             }
+        }
+
+        // Backfill: for any still-orphaned block, request its missing ancestors
+        // (throttled, re-requested until resolved so lost messages recover).
+        if !pending.is_empty() && last_request.elapsed() >= Duration::from_millis(300) {
+            let mut wanted = std::collections::HashSet::new();
+            for block in &pending {
+                for parent in &block.header.parents {
+                    if !chain.has_block(parent) {
+                        wanted.insert(*parent);
+                    }
+                }
+            }
+            for id in wanted {
+                network.broadcast(&NetMsg::GetBlock(id));
+            }
+            last_request = Instant::now();
         }
 
         // Mine on the current tips at the configured cadence.

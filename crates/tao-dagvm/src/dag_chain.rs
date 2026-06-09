@@ -354,6 +354,23 @@ impl DagChain {
         Ok(bank)
     }
 
+    /// Reconstruct a stored block by id (for serving peer backfill requests),
+    /// or `None` if we don't have it. Genesis (no stored header txs) is included.
+    pub fn get_block(&self, id: &[u8; 32]) -> Option<DagBlock> {
+        let header = self.headers.get(id)?.clone();
+        let transactions = self
+            .block_txs
+            .get(id)
+            .map(|txs| txs.iter().map(|t| bincode::serialize(t).expect("tx serialize")).collect())
+            .unwrap_or_default();
+        Some(DagBlock { header, transactions })
+    }
+
+    /// True if this block id is known (accepted) by the chain.
+    pub fn has_block(&self, id: &[u8; 32]) -> bool {
+        self.blocks.contains(id)
+    }
+
     pub fn tips(&self) -> &[[u8; 32]] {
         &self.tips
     }
@@ -545,6 +562,30 @@ mod tests {
             work_for_target(&nt) > work_for_target(&easy_target()),
             "fast blocks raise difficulty (more work than genesis)"
         );
+    }
+
+    #[test]
+    fn get_block_round_trips_for_backfill() {
+        // A served block must reconstruct identically (same id) so a peer can
+        // accept it during ancestor backfill.
+        let payer = solana_keypair::Keypair::new();
+        let a = solana_keypair::Keypair::new();
+        let miner = Pubkey::new_unique();
+        let mut chain = DagChain::open(
+            dir("getblock"),
+            3,
+            easy_target(),
+            miner,
+            0,
+            vec![(payer.pubkey(), 1_000_000_000)],
+        )
+        .unwrap();
+        let mined = chain.mine(&[transfer(&payer, &a.pubkey(), 100_000_000)]).unwrap();
+        let served = chain.get_block(&mined.id()).expect("have the block");
+        assert_eq!(served.id(), mined.id(), "reconstructed block id matches");
+        assert_eq!(served.transactions, mined.transactions, "txs round-trip");
+        assert!(chain.has_block(&mined.id()));
+        assert!(chain.get_block(&[9u8; 32]).is_none(), "unknown id → None");
     }
 
     #[test]
