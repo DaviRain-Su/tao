@@ -46,6 +46,20 @@ enum LogRecord {
     Snapshot { origin_header: DagBlockHeader, accounts: Vec<(Pubkey, AccountSharedData)> },
 }
 
+/// Bootstrap payload a pruned node ships to a fresh/behind peer: the pruning
+/// point (origin header + its account-set snapshot) plus the kept suffix blocks.
+///
+/// The suffix is applied as *trusted* (no PoW/difficulty re-validation): a pruned
+/// node has discarded the history needed to re-derive the difficulty window for
+/// those finalized blocks. A trustless bootstrap needs PoW pruning proofs (Kaspa)
+/// — a documented follow-on; for now the snapshot is trusted like a checkpoint.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SyncSnapshot {
+    origin_header: DagBlockHeader,
+    accounts: Vec<(Pubkey, AccountSharedData)>,
+    suffix: Vec<DagBlock>,
+}
+
 /// A single-node blockDAG with PoW, persistence, and SVM-executed state.
 pub struct DagChain {
     engine: DagEngine,
@@ -578,6 +592,50 @@ impl DagChain {
     /// Whether finalized transaction history has been pruned.
     pub fn is_history_pruned(&self) -> bool {
         self.history_pruned
+    }
+
+    /// Export a bootstrap snapshot (pruning point + base accounts + kept suffix)
+    /// for syncing a fresh/behind peer. `None` if this node hasn't pruned (such a
+    /// node serves full history via block backfill instead).
+    pub fn export_snapshot(&self) -> Option<Vec<u8>> {
+        if !self.history_pruned {
+            return None;
+        }
+        let origin = self.genesis_dag.to_bytes();
+        let origin_header = self.headers.get(&origin)?.clone();
+        let accounts = self.base_accounts.clone()?;
+        let order = self.total_order();
+        let suffix: Vec<DagBlock> = order.iter().skip(1).filter_map(|id| self.get_block(id)).collect();
+        bincode::serialize(&SyncSnapshot { origin_header, accounts, suffix }).ok()
+    }
+
+    /// Adopt a bootstrap snapshot from a pruned peer: re-anchor at its pruning
+    /// point and apply the trusted suffix. Returns `false` (no-op) if we already
+    /// have the snapshot's origin (caught up / ahead). Persists a compacted log.
+    pub fn import_snapshot(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        let snap: SyncSnapshot = bincode::deserialize(bytes).map_err(|e| e.to_string())?;
+        let origin = snap.origin_header.id();
+        if self.blocks.contains(&origin) {
+            return Ok(false);
+        }
+        self.load_snapshot(snap.origin_header.clone(), snap.accounts.clone());
+        for block in &snap.suffix {
+            self.apply(block)?; // trusted: no PoW / difficulty re-validation
+        }
+        // Persist a compacted log so a restart reproduces the synced chain.
+        let mut records: Vec<Vec<u8>> = Vec::with_capacity(1 + snap.suffix.len());
+        records.push(
+            bincode::serialize(&LogRecord::Snapshot {
+                origin_header: snap.origin_header,
+                accounts: snap.accounts,
+            })
+            .map_err(|e| e.to_string())?,
+        );
+        for block in &snap.suffix {
+            records.push(bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?);
+        }
+        self.log.replace_all(&records).map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     /// Re-anchor the DAG at a finalized pruning point, discarding its entire past
@@ -1146,6 +1204,68 @@ mod tests {
         let v = reopened.virtual_state().unwrap().state_root().unwrap();
         let r = reopened.rebuild_state().unwrap().state_root().unwrap();
         assert_eq!(v, r, "post-restart mining stays consistent");
+    }
+
+    #[test]
+    fn snapshot_sync_bootstraps_a_fresh_node() {
+        // A pruned node bootstraps a fresh node from its snapshot: the fresh node
+        // reaches the identical order and state without ever seeing pruned history.
+        let payer = solana_keypair::Keypair::new();
+        let a = solana_keypair::Keypair::new();
+        let miner = Pubkey::new_unique();
+        let allocs = vec![(payer.pubkey(), 1_000_000_000)];
+
+        let mut node1 = DagChain::open_with_daa(
+            dir("snap-src"),
+            3,
+            easy_target(),
+            miner,
+            1_000_000,
+            allocs.clone(),
+            10,
+            5,
+        )
+        .unwrap();
+        node1.set_finality_depth(2);
+        let mut ts = 1_000_000i64;
+        for i in 0..24 {
+            let txs = if i < 3 {
+                vec![transfer(&payer, &a.pubkey(), 20_000_000)]
+            } else {
+                vec![]
+            };
+            node1.mine_at(&txs, ts).unwrap();
+            ts += 10;
+            node1.virtual_state().unwrap();
+        }
+        assert!(node1.prune().unwrap() > 0);
+        let snap = node1.export_snapshot().expect("pruned node exports a snapshot");
+        let want_order = node1.total_order();
+        let want_root = node1.virtual_state().unwrap().state_root().unwrap();
+
+        // Fresh node: only genesis until it adopts the snapshot.
+        let mut node2 = DagChain::open_with_daa(
+            dir("snap-dst"),
+            3,
+            easy_target(),
+            miner,
+            1_000_000,
+            allocs,
+            10,
+            5,
+        )
+        .unwrap();
+        node2.set_finality_depth(2);
+        assert!(node2.import_snapshot(&snap).unwrap(), "fresh node adopts the snapshot");
+        assert!(node2.is_history_pruned());
+        assert_eq!(node2.total_order(), want_order, "bootstrapped order matches");
+        assert_eq!(
+            node2.virtual_state().unwrap().state_root().unwrap(),
+            want_root,
+            "bootstrapped state matches"
+        );
+        // Re-importing is a no-op (already have the origin).
+        assert!(!node2.import_snapshot(&snap).unwrap());
     }
 
     #[test]

@@ -273,6 +273,18 @@ fn dag_run(
                         }
                     }
                 }
+                NetMsg::GetSnapshot => {
+                    if let Some(snap) = chain.export_snapshot() {
+                        network.broadcast(&NetMsg::Snapshot(snap));
+                    }
+                }
+                NetMsg::Snapshot(bytes) => {
+                    match chain.import_snapshot(&bytes) {
+                        Ok(true) => tracing::info!(blocks = chain.block_count(), "bootstrapped from snapshot"),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(error = %e, "snapshot import failed"),
+                    }
+                }
                 NetMsg::NewTx(_) => {}
             }
         }
@@ -307,6 +319,9 @@ fn dag_run(
             for id in wanted {
                 network.broadcast(&NetMsg::GetBlock(id));
             }
+            // Orphans we can't resolve may have pruned ancestors — ask a pruned
+            // peer to bootstrap us from its snapshot.
+            network.broadcast(&NetMsg::GetSnapshot);
             last_request = Instant::now();
         }
 

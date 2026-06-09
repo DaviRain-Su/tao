@@ -36,6 +36,12 @@ pub enum NetMsg {
     /// Announce current DAG tip block ids (response to `GetTips`). The requester
     /// `GetBlock`s any tip it doesn't have, which transitively backfills.
     Tips(Vec<[u8; 32]>),
+    /// Ask a (pruned) peer for its bootstrap snapshot. Used when block backfill
+    /// stalls because the needed ancestors were pruned.
+    GetSnapshot,
+    /// A serialized bootstrap snapshot (pruning point + base state + kept suffix),
+    /// response to `GetSnapshot`. The requester adopts it if it is behind.
+    Snapshot(Vec<u8>),
 }
 
 /// A handle to the gossip network: broadcast out, peers in via the inbound channel.
