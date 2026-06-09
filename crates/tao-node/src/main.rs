@@ -328,14 +328,17 @@ fn dag_run(
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let bank = chain.rebuild_state().map_err(|e| anyhow::anyhow!("rebuild: {e}"))?;
+    let (balance, root) = {
+        let bank = chain.virtual_state().map_err(|e| anyhow::anyhow!("virtual state: {e}"))?;
+        (bank.balance(&miner_pubkey), bank.state_root().map_err(|e| anyhow::anyhow!("{e}"))?)
+    };
     println!(
         "stopped: blocks={} tips={} order={} miner_balance={} state_root={}",
         chain.block_count(),
         chain.tips().len(),
         chain.total_order().len(),
-        bank.balance(&miner_pubkey),
-        hex_bytes(&bank.state_root().map_err(|e| anyhow::anyhow!("{e}"))?)
+        balance,
+        hex_bytes(&root)
     );
     Ok(())
 }
@@ -349,15 +352,17 @@ fn dag_mine(data_dir: PathBuf, miner: String, blocks: u64, k: u16) -> anyhow::Re
         chain.mine(&[]).map_err(|e| anyhow::anyhow!("mine: {e}"))?;
     }
 
-    let bank = chain.rebuild_state().map_err(|e| anyhow::anyhow!("rebuild state: {e}"))?;
-    let state_root = bank.state_root().map_err(|e| anyhow::anyhow!("state root: {e}"))?;
-    let order = chain.total_order();
+    let (balance, state_root) = {
+        let bank = chain.virtual_state().map_err(|e| anyhow::anyhow!("virtual state: {e}"))?;
+        (bank.balance(&miner_pubkey), bank.state_root().map_err(|e| anyhow::anyhow!("state root: {e}"))?)
+    };
+    let order_len = chain.total_order().len();
 
     println!("blockDAG mined:");
     println!("  blocks (incl. genesis): {}", chain.block_count());
     println!("  tips:                   {}", chain.tips().len());
-    println!("  total-order length:     {}", order.len());
-    println!("  miner balance:          {}", bank.balance(&miner_pubkey));
+    println!("  total-order length:     {order_len}");
+    println!("  miner balance:          {balance}");
     println!("  state root:             {}", hex_bytes(&state_root));
     Ok(())
 }

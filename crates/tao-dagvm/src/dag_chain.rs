@@ -15,7 +15,7 @@
 //! [`DagChain::open_with_daa`] to enable adjustment.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -91,6 +91,11 @@ pub struct DagChain {
     reward: u64,
     accounts_dir: PathBuf,
     allocations: Vec<(Pubkey, u64)>,
+    /// Cached "virtual" state and the exact block order it reflects, for
+    /// incremental replay (append-only fast path; reorg ⇒ full rebuild).
+    state: Option<Bank>,
+    state_dir: PathBuf,
+    executed: Vec<[u8; 32]>,
 }
 
 impl DagChain {
@@ -155,6 +160,9 @@ impl DagChain {
             reward,
             accounts_dir: data_dir.join("accounts"),
             allocations,
+            state: None,
+            state_dir: data_dir.join("state"),
+            executed: Vec::new(),
         };
 
         // Replay the log.
@@ -322,36 +330,77 @@ impl DagChain {
         self.engine.total_order().into_iter().map(|h| h.to_bytes()).collect()
     }
 
-    /// Rebuild the SVM state by executing the GHOSTDAG total order from genesis,
-    /// returning a `Bank` over a freshly-built account store. Correct under
-    /// parallel blocks / reorgs.
-    pub fn rebuild_state(&self) -> Result<Bank, BankError> {
-        let _ = std::fs::remove_dir_all(&self.accounts_dir);
-        let db = Arc::new(
-            AccountsDb::open(&self.accounts_dir).map_err(|e| BankError::Storage(e.to_string()))?,
-        );
+    /// A fresh `Bank` over a wiped account store at `dir`, seeded with the
+    /// genesis allocations (the state *before* any block executes).
+    fn fresh_bank(&self, dir: &Path) -> Result<Bank, BankError> {
+        let _ = std::fs::remove_dir_all(dir);
+        let db = Arc::new(AccountsDb::open(dir).map_err(|e| BankError::Storage(e.to_string()))?);
         let system = solana_sdk_ids::system_program::id();
         for (pubkey, lamports) in &self.allocations {
             db.set(pubkey, &AccountSharedData::new(*lamports, 0, &system))
                 .map_err(|e| BankError::Storage(e.to_string()))?;
         }
-        let bank = Bank::new(db, 0);
+        Ok(Bank::new(db, 0))
+    }
 
+    /// Execute the given block ids (in order) through `bank`: each non-genesis
+    /// block credits the coinbase then runs its transactions.
+    fn replay_blocks(&self, bank: &Bank, blocks: &[[u8; 32]]) -> Result<(), BankError> {
+        let genesis = self.genesis_dag.to_bytes();
         let bh = env_blockhash();
-        for block in self.engine.total_order() {
-            if block == self.genesis_dag {
+        for block in blocks {
+            if *block == genesis {
                 continue;
             }
             if self.reward > 0 {
                 bank.airdrop(&self.miner, self.reward)?;
             }
-            if let Some(txs) = self.block_txs.get(&block.to_bytes()) {
+            if let Some(txs) = self.block_txs.get(block) {
                 for tx in txs {
                     let _ = bank.execute_transaction(tx, bh.clone())?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Rebuild the SVM state by executing the GHOSTDAG total order from genesis,
+    /// returning a `Bank` over a freshly-built account store. Authoritative and
+    /// always correct (used by [`Self::virtual_state`] as its reorg fallback and
+    /// as the cross-check in tests).
+    pub fn rebuild_state(&self) -> Result<Bank, BankError> {
+        let bank = self.fresh_bank(&self.accounts_dir)?;
+        self.replay_blocks(&bank, &self.total_order())?;
         Ok(bank)
+    }
+
+    /// The current "virtual" state, maintained incrementally: if the new total
+    /// order extends the order we last executed, only the appended suffix is
+    /// replayed onto the cached `Bank` (O(new blocks)); if the order reorged
+    /// (a prefix changed — e.g. a merge reordered finalized-but-recent blocks),
+    /// it falls back to a full rebuild. Result is always identical to
+    /// [`Self::rebuild_state`].
+    pub fn virtual_state(&mut self) -> Result<&Bank, BankError> {
+        let order = self.total_order();
+        let can_extend = self.state.is_some()
+            && order.len() >= self.executed.len()
+            && self.executed.as_slice() == &order[..self.executed.len()];
+
+        if can_extend {
+            let start = self.executed.len();
+            let bank = self.state.take().expect("checked is_some");
+            self.replay_blocks(&bank, &order[start..])?;
+            self.state = Some(bank);
+        } else {
+            // Drop the cached Bank first so its RocksDB releases state_dir
+            // before fresh_bank wipes and recreates it.
+            self.state = None;
+            let bank = self.fresh_bank(&self.state_dir)?;
+            self.replay_blocks(&bank, &order)?;
+            self.state = Some(bank);
+        }
+        self.executed = order;
+        Ok(self.state.as_ref().expect("set above"))
     }
 
     /// Reconstruct a stored block by id (for serving peer backfill requests),
@@ -562,6 +611,43 @@ mod tests {
             work_for_target(&nt) > work_for_target(&easy_target()),
             "fast blocks raise difficulty (more work than genesis)"
         );
+    }
+
+    #[test]
+    fn virtual_state_matches_full_replay() {
+        // The incremental virtual state must equal the authoritative full replay
+        // after every step — pure appends (fast path) and a parallel-block merge
+        // (which can reorder the recent order ⇒ reorg fallback).
+        let payer = solana_keypair::Keypair::new();
+        let a = solana_keypair::Keypair::new();
+        let b = solana_keypair::Keypair::new();
+        let miner = Pubkey::new_unique();
+        let allocs = vec![(payer.pubkey(), 1_000_000_000)];
+        // reward > 0 so coinbase is exercised on both paths.
+        let mut chain =
+            DagChain::open(dir("vstate"), 3, easy_target(), miner, 1_000_000, allocs.clone()).unwrap();
+
+        let check = |chain: &mut DagChain| {
+            let v = chain.virtual_state().unwrap().state_root().unwrap();
+            let r = chain.rebuild_state().unwrap().state_root().unwrap();
+            assert_eq!(v, r, "virtual state diverged from full replay");
+        };
+
+        chain.mine(&[transfer(&payer, &a.pubkey(), 100_000_000)]).unwrap();
+        check(&mut chain); // first call: full rebuild
+        chain.mine(&[transfer(&payer, &b.pubkey(), 50_000_000)]).unwrap();
+        check(&mut chain); // append fast path
+
+        // A parallel block off genesis, then a merge that spends from A.
+        let block2 = {
+            let tmp =
+                DagChain::open(dir("vstate-side"), 3, easy_target(), miner, 1_000_000, allocs).unwrap();
+            tmp.build_block(&[transfer(&payer, &a.pubkey(), 7_000_000)])
+        };
+        chain.accept(block2).unwrap();
+        check(&mut chain); // may reorg the recent order ⇒ fallback
+        chain.mine(&[transfer(&a, &b.pubkey(), 3_000_000)]).unwrap();
+        check(&mut chain);
     }
 
     #[test]
