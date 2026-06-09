@@ -5,12 +5,19 @@
 //! deterministic `state_root` so independent nodes can confirm they reached the
 //! same post-execution state.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use rocksdb::{IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamily, IteratorMode, Options, WriteBatch, DB};
 use solana_account::{AccountSharedData, ReadableAccount};
 use solana_pubkey::Pubkey;
 use tao_core::error::{Result, TaoError};
+
+use crate::smt;
+
+/// Column family holding the persistent Sparse Merkle Tree nodes (accounts live
+/// in the default CF).
+const SMT_CF: &str = "smt";
 
 fn storage_err<E: std::fmt::Display>(e: E) -> TaoError {
     TaoError::Storage(e.to_string())
@@ -26,12 +33,19 @@ pub struct AccountsDb {
 }
 
 impl AccountsDb {
-    /// Open (creating if absent) the account store at `path`.
+    /// Open (creating if absent) the account store at `path`, with the SMT column
+    /// family. (The account store is a derived cache rebuilt from the block log on
+    /// startup, so the SMT is rebuilt incrementally alongside — no migration.)
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, path).map_err(storage_err)?;
+        opts.create_missing_column_families(true);
+        let db = DB::open_cf(&opts, path, [SMT_CF]).map_err(storage_err)?;
         Ok(Self { db })
+    }
+
+    fn smt_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(SMT_CF).expect("smt column family")
     }
 
     /// Fetch an account, if present.
@@ -42,32 +56,69 @@ impl AccountsDb {
         }
     }
 
-    /// Insert or overwrite a single account.
+    /// The SMT leaf value committed for an account (or `EMPTY_LEAF` if absent).
+    fn leaf_for(key: &Pubkey, bytes: Option<&[u8]>) -> [u8; 32] {
+        match bytes {
+            Some(b) => smt::leaf_hash(&key.to_bytes(), &Self::account_value_hash(b)),
+            None => smt::EMPTY_LEAF,
+        }
+    }
+
+    /// Apply SMT leaf updates into `batch` (atomic with the account writes). A
+    /// single overlay is used so updates within one call see each other's path
+    /// changes (correct when keys share path prefixes).
+    fn smt_update(&self, batch: &mut WriteBatch, leaves: &[([u8; 32], [u8; 32])]) {
+        let cf = self.smt_cf();
+        let mut overlay = Overlay { db: &self.db, cf, pending: HashMap::new() };
+        for (key, leaf) in leaves {
+            smt::update_leaf(&mut overlay, key, *leaf);
+        }
+        for (id, v) in overlay.pending {
+            match v {
+                Some(h) => batch.put_cf(cf, &id, h),
+                None => batch.delete_cf(cf, &id),
+            }
+        }
+    }
+
+    /// Insert or overwrite a single account (updates the SMT atomically).
     pub fn set(&self, key: &Pubkey, account: &AccountSharedData) -> Result<()> {
         let bytes = bincode::serialize(account).map_err(ser_err)?;
-        self.db.put(key.as_ref(), bytes).map_err(storage_err)
+        let leaf = Self::leaf_for(key, Some(&bytes));
+        let mut batch = WriteBatch::default();
+        batch.put(key.as_ref(), &bytes);
+        self.smt_update(&mut batch, &[(key.to_bytes(), leaf)]);
+        self.db.write(batch).map_err(storage_err)
     }
 
-    /// Remove an account.
+    /// Remove an account (updates the SMT atomically).
     pub fn delete(&self, key: &Pubkey) -> Result<()> {
-        self.db.delete(key.as_ref()).map_err(storage_err)
+        let mut batch = WriteBatch::default();
+        batch.delete(key.as_ref());
+        self.smt_update(&mut batch, &[(key.to_bytes(), smt::EMPTY_LEAF)]);
+        self.db.write(batch).map_err(storage_err)
     }
 
-    /// Atomically apply a set of account changes. Accounts that end up with zero
-    /// lamports and no data are purged (Solana semantics).
+    /// Atomically apply a set of account changes (and their SMT updates).
+    /// Accounts that end up with zero lamports and no data are purged (Solana
+    /// semantics).
     pub fn commit(
         &self,
         changes: impl IntoIterator<Item = (Pubkey, AccountSharedData)>,
     ) -> Result<()> {
         let mut batch = WriteBatch::default();
+        let mut leaves = Vec::new();
         for (key, account) in changes {
             if account.lamports() == 0 && account.data().is_empty() {
                 batch.delete(key.as_ref());
+                leaves.push((key.to_bytes(), smt::EMPTY_LEAF));
             } else {
                 let bytes = bincode::serialize(&account).map_err(ser_err)?;
+                leaves.push((key.to_bytes(), Self::leaf_for(&key, Some(&bytes))));
                 batch.put(key.as_ref(), bytes);
             }
         }
+        self.smt_update(&mut batch, &leaves);
         self.db.write(batch).map_err(storage_err)
     }
 
@@ -78,29 +129,15 @@ impl AccountsDb {
         *blake3::hash(account_bytes).as_bytes()
     }
 
-    /// Collect `(key, value_hash)` for every account, in arbitrary order.
-    fn smt_entries(&self) -> Result<Vec<([u8; 32], [u8; 32])>> {
-        let mut entries = Vec::new();
-        for item in self.db.iterator(IteratorMode::Start) {
-            let (k, v) = item.map_err(storage_err)?;
-            let key: [u8; 32] = k
-                .as_ref()
-                .try_into()
-                .map_err(|_| storage_err("account key is not 32 bytes"))?;
-            entries.push((key, Self::account_value_hash(&v)));
-        }
-        Ok(entries)
-    }
-
     /// The **Sparse Merkle Tree root** over the account set: a 256-bit commitment
-    /// that a light client can verify individual accounts against (see
-    /// [`state_proof`](Self::state_proof)). Deterministic — two nodes with the
-    /// same accounts agree.
-    ///
-    /// (Built from scratch per call; incremental O(log n) maintenance in storage
-    /// is a follow-on.)
+    /// a light client can verify individual accounts against (see
+    /// [`state_proof`](Self::state_proof)). Maintained incrementally in storage,
+    /// so this is an O(1) lookup. Deterministic — two nodes with the same accounts
+    /// agree (independent of insertion order).
     pub fn state_root(&self) -> Result<[u8; 32]> {
-        Ok(crate::smt::SparseMerkleTree::from_entries(self.smt_entries()?).root())
+        let cf = self.smt_cf();
+        let store = Overlay { db: &self.db, cf, pending: HashMap::new() };
+        Ok(smt::stored_root(&store))
     }
 
     /// A light-client proof for `key`: the account (or `None` if absent) plus its
@@ -111,9 +148,10 @@ impl AccountsDb {
     pub fn state_proof(
         &self,
         key: &Pubkey,
-    ) -> Result<(Option<AccountSharedData>, crate::smt::MerkleProof)> {
-        let tree = crate::smt::SparseMerkleTree::from_entries(self.smt_entries()?);
-        let proof = tree.proof(&key.to_bytes());
+    ) -> Result<(Option<AccountSharedData>, smt::MerkleProof)> {
+        let cf = self.smt_cf();
+        let store = Overlay { db: &self.db, cf, pending: HashMap::new() };
+        let proof = smt::stored_proof(&store, &key.to_bytes());
         Ok((self.get(key)?, proof))
     }
 
@@ -143,6 +181,36 @@ impl AccountsDb {
 
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.db.iterator(IteratorMode::Start).next().is_none())
+    }
+}
+
+/// A [`smt::NodeStore`] over the SMT column family with a write overlay: reads
+/// check `pending` first (so updates within one commit see each other), then fall
+/// through to RocksDB; writes accumulate in `pending` to be flushed to a
+/// `WriteBatch` by the caller (atomic with the account writes).
+struct Overlay<'a> {
+    db: &'a DB,
+    cf: &'a ColumnFamily,
+    pending: HashMap<Vec<u8>, Option<[u8; 32]>>,
+}
+
+impl smt::NodeStore for Overlay<'_> {
+    fn get_node(&self, id: &[u8]) -> Option<[u8; 32]> {
+        if let Some(v) = self.pending.get(id) {
+            return *v;
+        }
+        let bytes = self.db.get_cf(self.cf, id).ok().flatten()?;
+        (bytes.len() == 32).then(|| {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&bytes);
+            a
+        })
+    }
+    fn set_node(&mut self, id: &[u8], hash: [u8; 32]) {
+        self.pending.insert(id.to_vec(), Some(hash));
+    }
+    fn del_node(&mut self, id: &[u8]) {
+        self.pending.insert(id.to_vec(), None);
     }
 }
 

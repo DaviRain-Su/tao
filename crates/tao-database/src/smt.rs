@@ -152,9 +152,113 @@ pub fn verify(root: &[u8; 32], key: &[u8; 32], leaf: &[u8; 32], proof: &MerklePr
     &cur == root
 }
 
+// ---------------------------------------------------------------------------
+// Incremental / persistent variant: store only non-default nodes in a key-value
+// store, updating O(HEIGHT) nodes per leaf change. Root is an O(1) lookup. The
+// result is identical to the from-scratch [`SparseMerkleTree`] for the same set.
+// ---------------------------------------------------------------------------
+
+/// A key-value store of SMT nodes (node id → 32-byte hash). Absence = the
+/// per-level default (empty subtree) hash.
+pub trait NodeStore {
+    fn get_node(&self, id: &[u8]) -> Option<[u8; 32]>;
+    fn set_node(&mut self, id: &[u8], hash: [u8; 32]);
+    fn del_node(&mut self, id: &[u8]);
+}
+
+/// Per-level default hashes (public accessor).
+pub fn default_hashes() -> [[u8; 32]; HEIGHT + 1] {
+    defaults()
+}
+
+/// Canonical id of the node at `depth` on `key`'s path: `[depth:u16][first `depth`
+/// bits of key, MSB-first, trailing bits of the last byte masked to zero]`.
+pub fn node_id(key: &[u8; 32], depth: usize) -> Vec<u8> {
+    let nbytes = depth.div_ceil(8);
+    let mut id = Vec::with_capacity(2 + nbytes);
+    id.extend_from_slice(&(depth as u16).to_be_bytes());
+    for i in 0..nbytes {
+        let mut b = key[i];
+        if i == nbytes - 1 {
+            let used = depth - i * 8; // 1..=8 significant bits in the last byte
+            if used < 8 {
+                b &= !((1u8 << (8 - used)) - 1);
+            }
+        }
+        id.push(b);
+    }
+    id
+}
+
+fn flip_bit(key: &[u8; 32], depth: usize) -> [u8; 32] {
+    let mut k = *key;
+    k[depth / 8] ^= 1 << (7 - (depth % 8));
+    k
+}
+
+/// Set the leaf for `key` to `leaf` (pass [`EMPTY_LEAF`] to remove it) and
+/// recompute the path to the root, writing only non-default nodes.
+pub fn update_leaf<S: NodeStore>(store: &mut S, key: &[u8; 32], leaf: [u8; 32]) {
+    let d = defaults();
+    let mut cur_hash = leaf;
+    let mut cur_id = node_id(key, HEIGHT);
+    if cur_hash == d[HEIGHT] {
+        store.del_node(&cur_id);
+    } else {
+        store.set_node(&cur_id, cur_hash);
+    }
+    let mut depth = HEIGHT;
+    while depth > 0 {
+        let sib_id = node_id(&flip_bit(key, depth - 1), depth);
+        let sib = store.get_node(&sib_id).unwrap_or(d[depth]);
+        let (l, r) = if bit(key, depth - 1) == 0 { (cur_hash, sib) } else { (sib, cur_hash) };
+        let parent = hash2(&l, &r);
+        depth -= 1;
+        cur_hash = parent;
+        cur_id = node_id(key, depth);
+        if cur_hash == d[depth] {
+            store.del_node(&cur_id);
+        } else {
+            store.set_node(&cur_id, cur_hash);
+        }
+    }
+}
+
+/// The root from a node store (O(1) lookup).
+pub fn stored_root<S: NodeStore>(store: &S) -> [u8; 32] {
+    store.get_node(&node_id(&[0u8; 32], 0)).unwrap_or_else(|| defaults()[0])
+}
+
+/// Inclusion/exclusion proof for `key` read from a node store.
+pub fn stored_proof<S: NodeStore>(store: &S, key: &[u8; 32]) -> MerkleProof {
+    let d = defaults();
+    let mut siblings = Vec::with_capacity(HEIGHT);
+    for depth in 0..HEIGHT {
+        let sib_id = node_id(&flip_bit(key, depth), depth + 1);
+        siblings.push(store.get_node(&sib_id).unwrap_or(d[depth + 1]));
+    }
+    MerkleProof { siblings }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// In-memory NodeStore for testing the incremental variant.
+    #[derive(Default)]
+    struct MemStore(HashMap<Vec<u8>, [u8; 32]>);
+    impl NodeStore for MemStore {
+        fn get_node(&self, id: &[u8]) -> Option<[u8; 32]> {
+            self.0.get(id).copied()
+        }
+        fn set_node(&mut self, id: &[u8], hash: [u8; 32]) {
+            self.0.insert(id.to_vec(), hash);
+        }
+        fn del_node(&mut self, id: &[u8]) {
+            self.0.remove(id);
+        }
+    }
 
     fn k(b: u8) -> [u8; 32] {
         let mut x = [0u8; 32];
@@ -210,6 +314,47 @@ mod tests {
         assert!(verify(&root, &absent, &EMPTY_LEAF, &proof), "exclusion proof");
         // It is NOT present with any value.
         assert!(!verify(&root, &absent, &leaf_hash(&absent, &vh(1)), &proof));
+    }
+
+    #[test]
+    fn incremental_root_matches_from_scratch() {
+        // The persistent/incremental store must produce the same root and proofs
+        // as the from-scratch tree for the same account set, through inserts,
+        // updates, and deletes.
+        let mut store = MemStore::default();
+        let mut set: Vec<([u8; 32], [u8; 32])> = Vec::new();
+
+        let ops: &[([u8; 32], Option<[u8; 32]>)] = &[
+            (k(1), Some(vh(1))),
+            (k(200), Some(vh(2))),
+            (k(2), Some(vh(3))),
+            (k(1), Some(vh(9))),  // update
+            (k(128), Some(vh(4))),
+            (k(200), None),       // delete
+        ];
+        for (key, val) in ops {
+            match val {
+                Some(v) => {
+                    update_leaf(&mut store, key, leaf_hash(key, v));
+                    set.retain(|(kk, _)| kk != key);
+                    set.push((*key, *v));
+                }
+                None => {
+                    update_leaf(&mut store, key, EMPTY_LEAF);
+                    set.retain(|(kk, _)| kk != key);
+                }
+            }
+            let reference = SparseMerkleTree::from_entries(set.clone()).root();
+            assert_eq!(stored_root(&store), reference, "incremental root diverged");
+        }
+
+        // A proof read from the store verifies against the stored root.
+        let root = stored_root(&store);
+        let proof = stored_proof(&store, &k(1));
+        assert!(verify(&root, &k(1), &leaf_hash(&k(1), &vh(9)), &proof));
+        // Deleted key proves absent.
+        let xproof = stored_proof(&store, &k(200));
+        assert!(verify(&root, &k(200), &EMPTY_LEAF, &xproof));
     }
 
     #[test]
