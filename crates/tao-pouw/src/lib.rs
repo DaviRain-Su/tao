@@ -297,4 +297,17 @@ mod tests {
         bad.height = 2;
         assert!(!gate.verify(&bad) || gate.pow_hash(&bad) != gate.pow_hash(&h));
     }
+
+    /// Two nodes deriving the model from the same genesis seed agree on the model
+    /// id (the Merkle commitment) — the consensus property that lets a multi-node
+    /// `--pouw` testnet validate each other's utility-gated blocks. A different
+    /// seed yields a different model.
+    #[test]
+    fn same_genesis_seed_yields_same_model_id() {
+        let a = UtilityGatePow::from_seed("tao-devnet-pouw", 8, 2, 8, [0x11; 32]);
+        let b = UtilityGatePow::from_seed("tao-devnet-pouw", 8, 2, 8, [0x11; 32]);
+        assert_eq!(a.model_id(), b.model_id(), "same genesis model ⇒ same id (nodes agree)");
+        let c = UtilityGatePow::from_seed("tao-devnet-pouw", 8, 2, 8, [0x22; 32]);
+        assert_ne!(a.model_id(), c.model_id(), "different weights ⇒ different model id");
+    }
 }
