@@ -34,6 +34,9 @@ pub fn meets_target(hash: &[u8; 32], target: &Target) -> bool {
 /// bits (this is exactly Bitcoin's `GetBlockProof`).
 pub fn work_for_target(target: &Target) -> U256 {
     let t = to_u256(target);
+    if t.is_zero() {
+        return U256::MAX;
+    }
     // (!t) == 2^256 - 1 - t
     let numerator = !t;
     let denom = t.saturating_add(U256::one());
@@ -63,8 +66,11 @@ fn leading_zero_bits(x: &[u8; 32]) -> u32 {
 /// proof): high-level blocks are rare and sample the chain's accumulated work, so
 /// a short chain of them certifies a lot of work without the full history.
 ///
-/// Assumes `hash <= target` (a valid solution); returns 0 otherwise.
+/// Guarded against invalid solutions: returns 0 when `hash > target`.
 pub fn pow_level(pow_hash: &[u8; 32], target: &Target) -> u32 {
+    if !meets_target(pow_hash, target) {
+        return 0;
+    }
     leading_zero_bits(pow_hash).saturating_sub(leading_zero_bits(target))
 }
 
@@ -81,9 +87,7 @@ mod tests {
 
     #[test]
     fn roundtrip_u256() {
-        let t = target_from_hex(
-            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        );
+        let t = target_from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         assert_eq!(from_u256(to_u256(&t)), t);
     }
 
@@ -132,5 +136,20 @@ mod tests {
         let one_bit_harder =
             target_from_hex("007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         assert_eq!(pow_level(&one_bit_harder, &target), 1);
+    }
+
+    #[test]
+    fn work_for_zero_target_is_max() {
+        assert_eq!(work_for_target(&[0u8; 32]), U256::MAX);
+    }
+
+    #[test]
+    fn pow_level_zero_if_not_meeting_target() {
+        let target =
+            target_from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        // One larger than target, so not a valid PoW solution.
+        let invalid =
+            target_from_hex("01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert_eq!(pow_level(&invalid, &target), 0);
     }
 }

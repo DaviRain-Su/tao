@@ -20,7 +20,10 @@ impl BlockhashQueue {
     /// Track at most `max_age` recent hashes (Solana mainnet uses 150).
     pub fn new(max_age: usize) -> Self {
         assert!(max_age > 0, "max_age must be positive");
-        Self { recent: VecDeque::with_capacity(max_age), max_age }
+        Self {
+            recent: VecDeque::with_capacity(max_age),
+            max_age,
+        }
     }
 
     /// Record a newly accepted block hash, evicting the oldest beyond `max_age`.

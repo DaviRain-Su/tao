@@ -99,7 +99,8 @@ pub(crate) fn try_advancing_reindex_root(
     reindex_slack: u64,
 ) -> Result<()> {
     let current = store.get_reindex_root()?;
-    let (mut ancestor, next) = find_next_reindex_root(store, current, hint, reindex_depth, reindex_slack)?;
+    let (mut ancestor, next) =
+        find_next_reindex_root(store, current, hint, reindex_depth, reindex_slack)?;
 
     if current == next {
         return Ok(());

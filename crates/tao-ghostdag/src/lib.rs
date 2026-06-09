@@ -119,7 +119,11 @@ impl MemoryRelationsStore {
 
 impl RelationsStoreReader for MemoryRelationsStore {
     fn get_parents(&self, hash: Hash) -> Result<BlockHashes, StoreError> {
-        self.map.borrow().get(&hash).cloned().ok_or(StoreError::KeyNotFound(hash))
+        self.map
+            .borrow()
+            .get(&hash)
+            .cloned()
+            .ok_or(StoreError::KeyNotFound(hash))
     }
 }
 
@@ -177,7 +181,11 @@ impl GhostdagStoreReader for MemoryGhostdagStore {
         Ok(self.get_data(hash)?.blues_anticone_sizes.clone())
     }
     fn get_data(&self, hash: Hash) -> Result<Arc<GhostdagData>, StoreError> {
-        self.map.borrow().get(&hash).cloned().ok_or(StoreError::KeyNotFound(hash))
+        self.map
+            .borrow()
+            .get(&hash)
+            .cloned()
+            .ok_or(StoreError::KeyNotFound(hash))
     }
     fn has(&self, hash: Hash) -> Result<bool, StoreError> {
         Ok(self.map.borrow().contains_key(&hash))

@@ -35,14 +35,22 @@ impl Mempool {
     /// Submit a transaction. Returns true if it was added (not a duplicate
     /// and pool was not full).
     pub fn submit(&mut self, tx: Transaction) -> bool {
-        if let Some(sig) = tx.signatures.first().and_then(|s| TryInto::<[u8; 64]>::try_into(s.as_ref()).ok()) {
+        if let Some(sig) = tx
+            .signatures
+            .first()
+            .and_then(|s| TryInto::<[u8; 64]>::try_into(s.as_ref()).ok())
+        {
             if self.seen.contains(&sig) {
                 return false;
             }
             if self.txs.len() >= self.max_size {
                 // Simple eviction: drop the oldest when full.
                 if let Some(old) = self.txs.first() {
-                    if let Some(old_sig) = old.signatures.first().and_then(|s| TryInto::<[u8; 64]>::try_into(s.as_ref()).ok()) {
+                    if let Some(old_sig) = old
+                        .signatures
+                        .first()
+                        .and_then(|s| TryInto::<[u8; 64]>::try_into(s.as_ref()).ok())
+                    {
                         self.seen.remove(&old_sig);
                     }
                 }
@@ -63,7 +71,11 @@ impl Mempool {
         let count = max_count.min(self.txs.len());
         let drained: Vec<_> = self.txs.drain(0..count).collect();
         for tx in &drained {
-            if let Some(sig) = tx.signatures.first().and_then(|s| TryInto::<[u8; 64]>::try_into(s.as_ref()).ok()) {
+            if let Some(sig) = tx
+                .signatures
+                .first()
+                .and_then(|s| TryInto::<[u8; 64]>::try_into(s.as_ref()).ok())
+            {
                 self.seen.remove(&sig);
             }
         }

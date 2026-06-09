@@ -130,8 +130,11 @@ impl Dag {
 
         // Mergeset = past(id) \ (past(sp) ∪ {sp}), in topological order.
         let sp_past = &self.nodes[&sp].past;
-        let mut mergeset: Vec<BlockId> =
-            past.iter().copied().filter(|b| *b != sp && !sp_past.contains(b)).collect();
+        let mut mergeset: Vec<BlockId> = past
+            .iter()
+            .copied()
+            .filter(|b| *b != sp && !sp_past.contains(b))
+            .collect();
         mergeset.sort_by_key(|b| self.topo_key(*b));
 
         // Greedy GHOSTDAG k-cluster classification, seeded by the selected
@@ -140,8 +143,11 @@ impl Dag {
         let mut mergeset_blues = Vec::new();
         let mut mergeset_reds = Vec::new();
         for &c in &mergeset {
-            let anti: Vec<BlockId> =
-                accepted.iter().copied().filter(|&x| self.is_anticone(x, c)).collect();
+            let anti: Vec<BlockId> = accepted
+                .iter()
+                .copied()
+                .filter(|&x| self.is_anticone(x, c))
+                .collect();
             // Condition 1: c's blue anticone is within k.
             if anti.len() > self.k {
                 mergeset_reds.push(c);

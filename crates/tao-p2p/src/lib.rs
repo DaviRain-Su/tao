@@ -14,11 +14,24 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tao_core::error::{Result, TaoError};
+
+/// Max frame size accepted over the network.
+const MAX_MSG_SIZE: usize = 8 * 1024 * 1024;
+
+/// Per-peer identifier used by the local node for direct responses.
+pub type PeerId = usize;
+
+/// Inbound envelope with sender identity.
+#[derive(Debug, Clone)]
+pub struct InboundMsg {
+    pub from: PeerId,
+    pub msg: NetMsg,
+}
 
 /// A gossip message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +60,7 @@ pub enum NetMsg {
 /// A handle to the gossip network: broadcast out, peers in via the inbound channel.
 #[derive(Clone)]
 pub struct Network {
-    peers: Arc<Mutex<Vec<TcpStream>>>,
+    peers: Arc<Mutex<Vec<(PeerId, TcpStream)>>>,
 }
 
 impl Network {
@@ -56,20 +69,24 @@ impl Network {
     pub fn start(
         listen: SocketAddr,
         bootstrap: Vec<SocketAddr>,
-        inbound: Sender<NetMsg>,
+        inbound: Sender<InboundMsg>,
     ) -> Result<Network> {
-        let peers: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let peers: Arc<Mutex<Vec<(PeerId, TcpStream)>>> = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind(listen).map_err(TaoError::Io)?;
         tracing::info!(%listen, "p2p listening");
+        let next_peer_id = Arc::new(AtomicUsize::new(0));
 
         // Accept loop.
         {
             let peers = peers.clone();
             let inbound = inbound.clone();
+            let next_peer_id = next_peer_id.clone();
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     match stream {
-                        Ok(s) => add_connection(s, peers.clone(), inbound.clone()),
+                        Ok(s) => {
+                            add_connection(s, peers.clone(), next_peer_id.clone(), inbound.clone())
+                        }
                         Err(e) => tracing::warn!(error = %e, "accept failed"),
                     }
                 }
@@ -80,15 +97,18 @@ impl Network {
         for addr in bootstrap {
             let peers = peers.clone();
             let inbound = inbound.clone();
+            let next_peer_id = next_peer_id.clone();
             std::thread::spawn(move || {
                 for attempt in 0..30 {
                     match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                         Ok(s) => {
                             tracing::info!(%addr, "dialed peer");
-                            add_connection(s, peers, inbound);
+                            add_connection(s, peers, next_peer_id, inbound);
                             return;
                         }
-                        Err(_) => std::thread::sleep(Duration::from_millis(300 * (attempt.min(5) + 1))),
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(300 * (attempt.min(5) + 1)))
+                        }
                     }
                 }
                 tracing::warn!(%addr, "could not connect to bootstrap peer");
@@ -108,7 +128,38 @@ impl Network {
             }
         };
         let mut peers = self.peers.lock().unwrap();
-        peers.retain_mut(|s| s.write_all(&framed).and_then(|_| s.flush()).is_ok());
+        peers.retain_mut(|(_, stream)| {
+            stream
+                .write_all(&framed)
+                .and_then(|_| stream.flush())
+                .is_ok()
+        });
+    }
+
+    /// Send a message directly to a peer.
+    pub fn send_to(&self, peer: PeerId, msg: &NetMsg) -> Result<()> {
+        let framed = frame(msg)?;
+        let mut peers = self.peers.lock().unwrap();
+        let pos = peers
+            .iter()
+            .position(|(id, _)| *id == peer)
+            .ok_or_else(|| TaoError::Network("unknown peer".into()))?;
+        if peers[pos]
+            .1
+            .write_all(&framed)
+            .and_then(|_| peers[pos].1.flush())
+            .is_ok()
+        {
+            Ok(())
+        } else {
+            peers.remove(pos);
+            Err(TaoError::Network("peer write failed".into()))
+        }
+    }
+
+    /// Return one connected peer id for targeted requests.
+    pub fn any_peer(&self) -> Option<PeerId> {
+        self.peers.lock().unwrap().first().map(|(id, _)| *id)
     }
 
     /// Number of currently connected peers.
@@ -117,7 +168,12 @@ impl Network {
     }
 }
 
-fn add_connection(stream: TcpStream, peers: Arc<Mutex<Vec<TcpStream>>>, inbound: Sender<NetMsg>) {
+fn add_connection(
+    stream: TcpStream,
+    peers: Arc<Mutex<Vec<(PeerId, TcpStream)>>>,
+    next_peer_id: Arc<AtomicUsize>,
+    inbound: Sender<InboundMsg>,
+) {
     let reader = match stream.try_clone() {
         Ok(r) => r,
         Err(e) => {
@@ -125,19 +181,29 @@ fn add_connection(stream: TcpStream, peers: Arc<Mutex<Vec<TcpStream>>>, inbound:
             return;
         }
     };
-    peers.lock().unwrap().push(stream);
-    std::thread::spawn(move || read_loop(reader, inbound));
+    let peer = next_peer_id.fetch_add(1, Ordering::SeqCst);
+    peers.lock().unwrap().push((peer, stream));
+    std::thread::spawn(move || read_loop(reader, peer, peers, inbound));
 }
 
-fn read_loop(mut stream: TcpStream, inbound: Sender<NetMsg>) {
+fn read_loop(
+    mut stream: TcpStream,
+    peer: PeerId,
+    peers: Arc<Mutex<Vec<(PeerId, TcpStream)>>>,
+    inbound: Sender<InboundMsg>,
+) {
     loop {
         match read_frame(&mut stream) {
             Ok(msg) => {
-                if inbound.send(msg).is_err() {
+                if inbound.send(InboundMsg { from: peer, msg }).is_err() {
                     break; // consumer gone
                 }
             }
-            Err(_) => break, // EOF / error → drop connection
+            Err(_) => {
+                let mut peers = peers.lock().unwrap();
+                peers.retain(|(id, _)| *id != peer);
+                break;
+            }
         }
     }
 }
@@ -158,6 +224,11 @@ fn read_frame(stream: &mut TcpStream) -> Result<NetMsg> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).map_err(TaoError::Io)?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MSG_SIZE {
+        return Err(TaoError::Network(format!(
+            "frame too large: {len} > {MAX_MSG_SIZE}"
+        )));
+    }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).map_err(TaoError::Io)?;
     bincode::deserialize(&body).map_err(|e| TaoError::Network(e.to_string()))

@@ -34,9 +34,23 @@ impl Gd {
         let gd_store = Arc::new(MemoryGhostdagStore::new());
         let relations = Arc::new(MemoryRelationsStore::new());
         let service = MtReachabilityService::new(reach.clone());
-        let manager = GhostdagManager::new(genesis, k, gd_store.clone(), relations.clone(), service, UnitWork);
-        gd_store.insert(blockhash::ORIGIN, manager.origin_ghostdag_data()).unwrap();
-        Self { reach, gd_store, relations, manager }
+        let manager = GhostdagManager::new(
+            genesis,
+            k,
+            gd_store.clone(),
+            relations.clone(),
+            service,
+            UnitWork,
+        );
+        gd_store
+            .insert(blockhash::ORIGIN, manager.origin_ghostdag_data())
+            .unwrap();
+        Self {
+            reach,
+            gd_store,
+            relations,
+            manager,
+        }
     }
 
     fn add(&self, id: u64, parents: &[Hash]) {
@@ -53,7 +67,8 @@ impl Gd {
         inquirer::hint_virtual_selected_parent(&mut *self.reach.write().unwrap(), block).unwrap();
 
         self.gd_store.insert(block, Arc::new(data)).unwrap();
-        self.relations.insert(block, BlockHashes::new(parents.to_vec()));
+        self.relations
+            .insert(block, BlockHashes::new(parents.to_vec()));
     }
 
     fn data(&self, id: u64) -> Arc<crate::GhostdagData> {
@@ -61,11 +76,15 @@ impl Gd {
     }
 
     fn is_blue_in(&self, container: u64, block: u64) -> bool {
-        self.data(container).mergeset_blues.contains(&Hash::from(block))
+        self.data(container)
+            .mergeset_blues
+            .contains(&Hash::from(block))
     }
 
     fn is_red_in(&self, container: u64, block: u64) -> bool {
-        self.data(container).mergeset_reds.contains(&Hash::from(block))
+        self.data(container)
+            .mergeset_reds
+            .contains(&Hash::from(block))
     }
 }
 

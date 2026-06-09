@@ -619,10 +619,12 @@ impl DagChain {
             .collect()
     }
 
-    /// Set the finality depth (blocks kept beyond the checkpoint). `0` disables
-    /// checkpointing (reorgs then always rebuild from genesis).
+    /// Set the finality depth (blocks kept beyond the checkpoint).
+    ///
+    /// Depth must be at least `1`; `0` can trigger divergent LWMA windows at
+    /// the pruning boundary.
     pub fn set_finality_depth(&mut self, depth: u64) {
-        self.finality_depth = depth;
+        self.finality_depth = depth.max(1);
     }
 
     /// A fresh `Bank` over a wiped account store at `dir`. When `seed_genesis`,
@@ -1905,8 +1907,9 @@ mod tests {
         // which competing peers' snapshots arrive; a lower-work proof is refused.
         let miner = Pubkey::new_unique();
         let build = |tag: &str, n: usize| {
-            let mut c = DagChain::open_with_daa(dir(tag), 3, easy_target(), miner, 0, vec![], 10, 5)
-                .unwrap();
+            let mut c =
+                DagChain::open_with_daa(dir(tag), 3, easy_target(), miner, 0, vec![], 10, 5)
+                    .unwrap();
             c.set_finality_depth(2);
             // Mine after the genesis timestamp so solve times are uniform (no
             // negative-solvetime difficulty bump): both chains share difficulty, so
@@ -1925,23 +1928,41 @@ mod tests {
         let snap_large = large.export_snapshot().unwrap();
 
         let fresh = |tag: &str| {
-            let mut c = DagChain::open_with_daa(dir(tag), 3, easy_target(), miner, 0, vec![], 10, 5)
-                .unwrap();
+            let mut c =
+                DagChain::open_with_daa(dir(tag), 3, easy_target(), miner, 0, vec![], 10, 5)
+                    .unwrap();
             c.set_finality_depth(2);
             c
         };
 
         // small then large → upgrades to the higher-work chain.
         let mut n1 = fresh("mw-n1");
-        assert!(n1.import_snapshot(&snap_small).unwrap(), "fresh node adopts first proof");
-        assert!(n1.import_snapshot(&snap_large).unwrap(), "switches to the stronger proof");
-        assert_eq!(n1.total_order(), large.total_order(), "n1 ends on the large chain");
+        assert!(
+            n1.import_snapshot(&snap_small).unwrap(),
+            "fresh node adopts first proof"
+        );
+        assert!(
+            n1.import_snapshot(&snap_large).unwrap(),
+            "switches to the stronger proof"
+        );
+        assert_eq!(
+            n1.total_order(),
+            large.total_order(),
+            "n1 ends on the large chain"
+        );
 
         // large then small → keeps the higher-work chain.
         let mut n2 = fresh("mw-n2");
         assert!(n2.import_snapshot(&snap_large).unwrap());
-        assert!(!n2.import_snapshot(&snap_small).unwrap(), "weaker proof refused");
-        assert_eq!(n2.total_order(), large.total_order(), "n2 keeps the large chain");
+        assert!(
+            !n2.import_snapshot(&snap_small).unwrap(),
+            "weaker proof refused"
+        );
+        assert_eq!(
+            n2.total_order(),
+            large.total_order(),
+            "n2 keeps the large chain"
+        );
     }
 
     #[test]
@@ -1978,7 +1999,11 @@ mod tests {
             fresh.import_snapshot(&snap).unwrap(),
             "fresh node bootstraps from a twice-pruned node (proof still genesis-anchored)"
         );
-        assert_eq!(fresh.total_order(), src.total_order(), "bootstrapped order matches");
+        assert_eq!(
+            fresh.total_order(),
+            src.total_order(),
+            "bootstrapped order matches"
+        );
         assert_eq!(
             fresh.virtual_state().unwrap().state_root().unwrap(),
             src.virtual_state().unwrap().state_root().unwrap(),

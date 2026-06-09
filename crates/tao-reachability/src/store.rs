@@ -26,10 +26,21 @@ pub trait ReachabilityStoreReader {
 /// Write API. All writes are `&mut` since reachability is not append-only.
 pub trait ReachabilityStore: ReachabilityStoreReader {
     fn init(&mut self, origin: Hash, capacity: Interval) -> Result<(), StoreError>;
-    fn insert(&mut self, hash: Hash, parent: Hash, interval: Interval, height: u64) -> Result<(), StoreError>;
+    fn insert(
+        &mut self,
+        hash: Hash,
+        parent: Hash,
+        interval: Interval,
+        height: u64,
+    ) -> Result<(), StoreError>;
     fn set_interval(&mut self, hash: Hash, interval: Interval) -> Result<(), StoreError>;
     fn append_child(&mut self, hash: Hash, child: Hash) -> Result<(), StoreError>;
-    fn insert_future_covering_item(&mut self, hash: Hash, fci: Hash, insertion_index: usize) -> Result<(), StoreError>;
+    fn insert_future_covering_item(
+        &mut self,
+        hash: Hash,
+        fci: Hash,
+        insertion_index: usize,
+    ) -> Result<(), StoreError>;
     fn set_parent(&mut self, hash: Hash, new_parent: Hash) -> Result<(), StoreError>;
     fn replace_child(
         &mut self,
@@ -64,7 +75,13 @@ struct MemoryReachabilityData {
 
 impl MemoryReachabilityData {
     fn new(parent: Hash, interval: Interval, height: u64) -> Self {
-        Self { children: Arc::new(vec![]), parent, interval, height, future_covering_set: Arc::new(vec![]) }
+        Self {
+            children: Arc::new(vec![]),
+            parent,
+            interval,
+            height,
+            future_covering_set: Arc::new(vec![]),
+        }
     }
 }
 
@@ -84,7 +101,10 @@ impl Default for MemoryReachabilityStore {
 
 impl MemoryReachabilityStore {
     pub fn new() -> Self {
-        Self { map: BlockHashMap::new(), reindex_root: None }
+        Self {
+            map: BlockHashMap::new(),
+            reindex_root: None,
+        }
     }
 
     fn get_data_mut(&mut self, hash: Hash) -> Result<&mut MemoryReachabilityData, StoreError> {
@@ -103,7 +123,13 @@ impl ReachabilityStore for MemoryReachabilityStore {
         Ok(())
     }
 
-    fn insert(&mut self, hash: Hash, parent: Hash, interval: Interval, height: u64) -> Result<(), StoreError> {
+    fn insert(
+        &mut self,
+        hash: Hash,
+        parent: Hash,
+        interval: Interval,
+        height: u64,
+    ) -> Result<(), StoreError> {
         if let Vacant(e) = self.map.entry(hash) {
             e.insert(MemoryReachabilityData::new(parent, interval, height));
             Ok(())
@@ -123,7 +149,12 @@ impl ReachabilityStore for MemoryReachabilityStore {
         Ok(())
     }
 
-    fn insert_future_covering_item(&mut self, hash: Hash, fci: Hash, insertion_index: usize) -> Result<(), StoreError> {
+    fn insert_future_covering_item(
+        &mut self,
+        hash: Hash,
+        fci: Hash,
+        insertion_index: usize,
+    ) -> Result<(), StoreError> {
         let data = self.get_data_mut(hash)?;
         Arc::make_mut(&mut data.future_covering_set).insert(insertion_index, fci);
         Ok(())
@@ -143,7 +174,10 @@ impl ReachabilityStore for MemoryReachabilityStore {
     ) -> Result<(), StoreError> {
         let data = self.get_data_mut(hash)?;
         let removed: Vec<Hash> = Arc::make_mut(&mut data.children)
-            .splice(replaced_index..replaced_index + 1, replace_with.iter().copied())
+            .splice(
+                replaced_index..replaced_index + 1,
+                replace_with.iter().copied(),
+            )
             .collect();
         debug_assert_eq!(removed.len(), 1);
         debug_assert_eq!(replaced_hash, removed[0]);
@@ -159,7 +193,10 @@ impl ReachabilityStore for MemoryReachabilityStore {
     ) -> Result<(), StoreError> {
         let data = self.get_data_mut(hash)?;
         let removed: Vec<Hash> = Arc::make_mut(&mut data.future_covering_set)
-            .splice(replaced_index..replaced_index + 1, replace_with.iter().copied())
+            .splice(
+                replaced_index..replaced_index + 1,
+                replace_with.iter().copied(),
+            )
             .collect();
         debug_assert_eq!(removed.len(), 1);
         debug_assert_eq!(replaced_hash, removed[0]);
@@ -181,7 +218,8 @@ impl ReachabilityStore for MemoryReachabilityStore {
     }
 
     fn get_reindex_root(&self) -> Result<Hash, StoreError> {
-        self.reindex_root.ok_or(StoreError::KeyNotFound(blockhash::NONE))
+        self.reindex_root
+            .ok_or(StoreError::KeyNotFound(blockhash::NONE))
     }
 }
 

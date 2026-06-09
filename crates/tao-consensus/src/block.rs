@@ -41,16 +41,8 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     /// Serialize the header deterministically (bincode) for hashing and storage.
-    ///
-    /// Serialization should never fail for an in-memory header; if it does, we
-    /// log and return an empty vector instead of panicking. Hashing an empty
-    /// header payload is never a correct chain value and will make the block
-    /// invalid, but it keeps the process alive in degraded IO/format conditions.
     pub fn serialize(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "block header serialization failed; returning empty payload");
-            Vec::new()
-        })
+        bincode::serialize(self).expect("block header serialization is infallible")
     }
 
     /// The block id: BLAKE3 of the serialized header (includes the nonce).
@@ -111,6 +103,7 @@ pub struct DagBlockHeader {
     pub tx_merkle_root: Hash,
     /// Commitment to post-execution account state. Reserved: the DAG keeps state
     /// as a derived cache (see `tao-dagvm`), so it is left zero for now.
+    #[serde(default)]
     pub state_root: Hash,
     /// PoW target threshold (big-endian). `pow_hash <= target` wins.
     pub target: Target,
@@ -118,6 +111,7 @@ pub struct DagBlockHeader {
     /// PoW level ≥ k. Committed to by PoW and validated on accept, so it can't be
     /// forged; it lets a pruned node retain a succinct proof of accumulated work.
     /// Empty for genesis.
+    #[serde(default)]
     pub interlink: Vec<BlockId>,
     /// PoW solution nonce.
     pub nonce: u64,
@@ -127,16 +121,8 @@ pub struct DagBlockHeader {
 
 impl DagBlockHeader {
     /// Serialize the header deterministically (bincode) for hashing and storage.
-    ///
-    /// Serialization should never fail for an in-memory header; if it does, we
-    /// log and return an empty vector instead of panicking. Hashing an empty
-    /// header payload is never a correct chain value and will make the block
-    /// invalid, but it keeps the process alive in degraded IO/format conditions.
     pub fn serialize(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "block header serialization failed; returning empty payload");
-            Vec::new()
-        })
+        bincode::serialize(self).expect("block header serialization is infallible")
     }
 
     /// The block id = BLAKE3 of the serialized header (also the PoW hash for the
@@ -163,6 +149,23 @@ impl DagBlock {
 
     pub fn id(&self) -> BlockId {
         self.header.id()
+    }
+
+    /// Decode a DAG block with legacy header compatibility.
+    ///
+    /// Supports the current header format and earlier serialized forms that may
+    /// still exist in long-lived nodes.
+    pub fn from_bytes(bytes: &[u8]) -> bincode::Result<Self> {
+        if let Ok(block) = bincode::deserialize::<Self>(bytes) {
+            return Ok(block);
+        }
+        if let Ok(block) = bincode::deserialize::<LegacyDagBlockV2>(bytes) {
+            return Ok(block.into());
+        }
+        if let Ok(block) = bincode::deserialize::<LegacyDagBlockV1>(bytes) {
+            return Ok(block.into());
+        }
+        bincode::deserialize::<Self>(bytes)
     }
 }
 
@@ -195,6 +198,85 @@ pub fn tx_merkle_root(transactions: &[Vec<u8>]) -> Hash {
             .collect();
     }
     Hash::new_from_array(level[0])
+}
+
+// Legacy M8 block formats used before `interlink`/migration compatibility.
+#[derive(Serialize, Deserialize)]
+struct LegacyDagBlockV1 {
+    /// Header format version.
+    pub version: u32,
+    /// Parent block ids (the GHOSTDAG parents). Empty only for genesis.
+    pub parents: Vec<BlockId>,
+    /// Block timestamp (unix seconds).
+    pub timestamp: i64,
+    /// Merkle root over the block's transactions.
+    pub tx_merkle_root: Hash,
+    /// PoW target threshold (big-endian). `pow_hash <= target` wins.
+    pub target: Target,
+    /// PoW solution nonce.
+    pub nonce: u64,
+    /// Address that receives this block's coinbase reward.
+    pub miner: Pubkey,
+    pub transactions: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyDagBlockV2 {
+    /// Header format version.
+    pub version: u32,
+    /// Parent block ids (the GHOSTDAG parents). Empty only for genesis.
+    pub parents: Vec<BlockId>,
+    /// Block timestamp (unix seconds).
+    pub timestamp: i64,
+    /// Merkle root over the block's transactions.
+    pub tx_merkle_root: Hash,
+    /// Commitment to post-execution account state.
+    pub state_root: Hash,
+    /// PoW target threshold (big-endian). `pow_hash <= target` wins.
+    pub target: Target,
+    /// PoW solution nonce.
+    pub nonce: u64,
+    /// Address that receives this block's coinbase reward.
+    pub miner: Pubkey,
+    pub transactions: Vec<Vec<u8>>,
+}
+
+impl From<LegacyDagBlockV1> for DagBlock {
+    fn from(value: LegacyDagBlockV1) -> Self {
+        Self {
+            header: DagBlockHeader {
+                version: value.version,
+                parents: value.parents,
+                timestamp: value.timestamp,
+                tx_merkle_root: value.tx_merkle_root,
+                state_root: Hash::default(),
+                target: value.target,
+                interlink: Vec::new(),
+                nonce: value.nonce,
+                miner: value.miner,
+            },
+            transactions: value.transactions,
+        }
+    }
+}
+
+impl From<LegacyDagBlockV2> for DagBlock {
+    fn from(value: LegacyDagBlockV2) -> Self {
+        Self {
+            header: DagBlockHeader {
+                version: value.version,
+                parents: value.parents,
+                timestamp: value.timestamp,
+                tx_merkle_root: value.tx_merkle_root,
+                state_root: value.state_root,
+                target: value.target,
+                interlink: Vec::new(),
+                nonce: value.nonce,
+                miner: value.miner,
+            },
+            transactions: value.transactions,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,5 +321,63 @@ mod tests {
         let b = vec![vec![4u8, 5, 6], vec![1u8, 2, 3]];
         assert_eq!(tx_merkle_root(&a), tx_merkle_root(&a));
         assert_ne!(tx_merkle_root(&a), tx_merkle_root(&b));
+    }
+
+    #[test]
+    fn dag_block_from_bytes_accepts_current_format() {
+        let block = DagBlock {
+            header: DagBlockHeader {
+                version: HEADER_VERSION,
+                parents: vec![[2u8; 32]],
+                timestamp: 1_750_000_000,
+                tx_merkle_root: Hash::default(),
+                state_root: Hash::default(),
+                target: [0xff; 32],
+                interlink: vec![[3u8; 32]],
+                nonce: 42,
+                miner: Pubkey::default(),
+            },
+            transactions: vec![vec![1, 2, 3]],
+        };
+        let bytes = bincode::serialize(&block).unwrap();
+        let decoded = DagBlock::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn dag_block_from_bytes_accepts_pre_interlink_format() {
+        let legacy = LegacyDagBlockV2 {
+            version: HEADER_VERSION,
+            parents: vec![[4u8; 32]],
+            timestamp: 1_750_000_001,
+            tx_merkle_root: Hash::default(),
+            state_root: Hash::new_from_array([9u8; 32]),
+            target: [0xee; 32],
+            nonce: 7,
+            miner: Pubkey::default(),
+            transactions: vec![vec![9]],
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let decoded = DagBlock::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.header.state_root, legacy.state_root);
+        assert!(decoded.header.interlink.is_empty());
+    }
+
+    #[test]
+    fn dag_block_from_bytes_accepts_legacy_format() {
+        let legacy = LegacyDagBlockV1 {
+            version: HEADER_VERSION,
+            parents: vec![[8u8; 32]],
+            timestamp: 1_750_000_002,
+            tx_merkle_root: Hash::default(),
+            target: [0xdd; 32],
+            nonce: 3,
+            miner: Pubkey::default(),
+            transactions: vec![vec![2]],
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let decoded = DagBlock::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.header.state_root, Hash::default());
+        assert!(decoded.header.interlink.is_empty());
     }
 }

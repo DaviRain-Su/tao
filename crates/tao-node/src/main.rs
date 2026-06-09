@@ -122,6 +122,24 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         finality_depth: u64,
     },
+    /// Run the M7b utility-gated matmul-PoUW miner: register a model, mine
+    /// model-bound matmul solutions (the work IS a real model layer applied to a
+    /// requested input), verify each against the model's Merkle commitment, and
+    /// emit the useful inference outputs.
+    UtilityMine {
+        /// Blocks (work items) to mine.
+        #[arg(long, default_value_t = 8)]
+        blocks: u64,
+        /// Matrix dimension n (n×n weight tiles and inputs).
+        #[arg(long, default_value_t = 8)]
+        n: usize,
+        /// Low-rank noise rank for the matmul-PoUW puzzle.
+        #[arg(long, default_value_t = 2)]
+        rank: usize,
+        /// Number of weight tiles (layers) in the demo model.
+        #[arg(long, default_value_t = 8)]
+        tiles: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -185,7 +203,67 @@ fn main() -> anyhow::Result<()> {
             k,
             finality_depth,
         ),
+        Command::UtilityMine { blocks, n, rank, tiles } => utility_mine(blocks, n, rank, tiles),
     }
+}
+
+/// M7b utility-gated matmul-PoUW: register a model with a Merkle commitment over
+/// its weight tiles, then for each block derive a work item (a real input applied
+/// to one of the model's layers), mine a model-bound solution (grinding the noise
+/// nonce until the PoW target is met), verify it against the commitment, and emit
+/// the useful inference output `A·B`. A miner using random/forged weights is
+/// rejected by the Merkle check — the work is provably a real model computation.
+fn utility_mine(blocks: u64, n: usize, rank: usize, tiles: usize) -> anyhow::Result<()> {
+    use tao_pouw::utility_gate::{ModelRegistry, UtilityGate, WorkItem};
+
+    if n == 0 || rank == 0 || rank > n || tiles == 0 {
+        return Err(anyhow::anyhow!("invalid dimensions: need 0<rank<=n, n>0, tiles>0"));
+    }
+
+    // Register a deterministic demo model (its id commits to the weights).
+    let weights: Vec<Vec<i64>> = (0..tiles)
+        .map(|t| (0..n * n).map(|i| ((t * 7 + i * 3) % 17) as i64 - 8).collect())
+        .collect();
+    let mut registry = ModelRegistry::new();
+    let model_id = registry.register("tao-demo-llm", n, &weights);
+    let gate = UtilityGate::new(rank);
+
+    // A few bits of PoW so the CPU prototype mines quickly.
+    let mut target = [0xffu8; 32];
+    target[0] = 0x00;
+
+    println!("utility-gated matmul-PoUW:");
+    println!("  model:     tao-demo-llm  id={}", hex_bytes(&model_id));
+    println!("  dims:      {n}x{n}  tiles={tiles}  rank={rank}");
+
+    let mut total_nonces: u128 = 0;
+    let mut output_checksum: i64 = 0;
+    for h in 0..blocks {
+        // Each block applies one model layer (tile) to a fresh requested input —
+        // a stand-in for a real paid inference request.
+        let tile_index = (h as usize) % tiles;
+        let input: Vec<i64> = (0..n * n).map(|i| ((h as usize + i) % 5) as i64 - 2).collect();
+        let work = WorkItem { model_id, tile_index, input };
+
+        let proof = registry
+            .tile_proof(&model_id, tile_index)
+            .ok_or_else(|| anyhow::anyhow!("missing tile proof"))?;
+        let sol = gate.solve(n, &work, &target, weights[tile_index].clone(), proof);
+
+        // A validating peer re-checks the binding (model + input + Merkle + PoW).
+        gate.verify(&registry, &work, &target, &sol)
+            .map_err(|e| anyhow::anyhow!("utility gate rejected block {h}: {e:?}"))?;
+
+        let output = gate.useful_output(&sol, n);
+        total_nonces += sol.nonce as u128 + 1;
+        output_checksum = output_checksum.wrapping_add(output.iter().sum::<i64>());
+        tracing::info!(block = h, tile = tile_index, nonce = sol.nonce, "mined + verified bound solution");
+    }
+
+    println!("  blocks:    {blocks}  (all verified against the model commitment)");
+    println!("  avg grind: {} nonces/block", if blocks > 0 { total_nonces / blocks as u128 } else { 0 });
+    println!("  output Σ:  {output_checksum}  (real A·B inference results)");
+    Ok(())
 }
 
 /// Helper: build the DagChain config (genesis target + allocations) shared by
@@ -249,9 +327,18 @@ fn dag_run(
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
     use tao_dagvm::DagBlock;
-    use tao_p2p::{NetMsg, Network};
+    use tao_p2p::{InboundMsg, NetMsg, Network};
 
     let (mut chain, miner_pubkey) = dag_open(data_dir, &miner, k)?;
+    let requested_finality_depth = finality_depth;
+    let finality_depth = requested_finality_depth.max(1);
+    if finality_depth != requested_finality_depth {
+        tracing::warn!(
+            requested = requested_finality_depth,
+            clamped = finality_depth,
+            "invalid --finality-depth, using minimum of 1"
+        );
+    }
     chain.set_finality_depth(finality_depth);
 
     let listen_addr: SocketAddr = listen
@@ -281,6 +368,7 @@ fn dag_run(
     let mut last_mine = Instant::now() - Duration::from_millis(block_interval_ms);
     let mut last_log = Instant::now();
     let mut last_request = Instant::now() - Duration::from_secs(1);
+    let mut last_snapshot_request = Instant::now() - Duration::from_secs(60);
     // Fire the first tip request immediately so a fresh node syncs on connect.
     let mut last_tipreq = Instant::now() - Duration::from_secs(10);
     let mut last_maint = Instant::now();
@@ -290,20 +378,25 @@ fn dag_run(
     while !shutdown.load(Ordering::Relaxed) {
         // Drain inbound: buffer announced blocks, serve backfill requests.
         while let Ok(msg) = rx.try_recv() {
+            let InboundMsg { from, msg } = msg;
             match msg {
                 NetMsg::NewBlock(bytes) => {
-                    if let Ok(block) = bincode::deserialize::<DagBlock>(&bytes) {
+                    if let Ok(block) = DagBlock::from_bytes(&bytes) {
                         pending.push(block);
                     }
                 }
                 NetMsg::GetBlock(id) => {
                     if let Some(block) = chain.get_block(&id) {
                         let bytes = bincode::serialize(&block).expect("serialize block");
-                        network.broadcast(&NetMsg::NewBlock(bytes));
+                        if let Err(e) = network.send_to(from, &NetMsg::NewBlock(bytes)) {
+                            tracing::warn!(error = %e, "send NewBlock response failed");
+                        }
                     }
                 }
                 NetMsg::GetTips => {
-                    network.broadcast(&NetMsg::Tips(chain.tips().to_vec()));
+                    if let Err(e) = network.send_to(from, &NetMsg::Tips(chain.tips().to_vec())) {
+                        tracing::warn!(error = %e, "send tips response failed");
+                    }
                 }
                 NetMsg::Tips(tips) => {
                     // Pull any tip we don't have → triggers transitive backfill.
@@ -315,7 +408,9 @@ fn dag_run(
                 }
                 NetMsg::GetSnapshot => {
                     if let Some(snap) = chain.export_snapshot() {
-                        network.broadcast(&NetMsg::Snapshot(snap));
+                        if let Err(e) = network.send_to(from, &NetMsg::Snapshot(snap)) {
+                            tracing::warn!(error = %e, "send snapshot response failed");
+                        }
                     }
                 }
                 NetMsg::Snapshot(bytes) => match chain.import_snapshot(&bytes) {
@@ -360,9 +455,17 @@ fn dag_run(
             for id in wanted {
                 network.broadcast(&NetMsg::GetBlock(id));
             }
-            // Orphans we can't resolve may have pruned ancestors — ask a pruned
-            // peer to bootstrap us from its snapshot.
-            network.broadcast(&NetMsg::GetSnapshot);
+            // Orphans we can't resolve may have pruned ancestors — ask one peer
+            // for a snapshot, rate-limited to protect weak peers.
+            if last_snapshot_request.elapsed() >= Duration::from_secs(60) {
+                if let Some(peer) = network.any_peer() {
+                    if let Err(e) = network.send_to(peer, &NetMsg::GetSnapshot) {
+                        tracing::warn!(error = %e, "request snapshot failed");
+                    } else {
+                        last_snapshot_request = Instant::now();
+                    }
+                }
+            }
             last_request = Instant::now();
         }
 
@@ -377,8 +480,9 @@ fn dag_run(
         // re-anchor at a finalized pruning point to bound memory (headers +
         // GHOSTDAG data + tx bodies). No-op until the chain is deep enough.
         if last_maint.elapsed() >= Duration::from_secs(5) {
-            let _ = chain.virtual_state();
-            if let Ok(n) = chain.prune() {
+            if let Err(e) = chain.virtual_state() {
+                tracing::warn!(error = %e, "virtual state failed during maintenance; skipping prune this cycle");
+            } else if let Ok(n) = chain.prune() {
                 if n > 0 {
                     tracing::info!(
                         pruned = n,

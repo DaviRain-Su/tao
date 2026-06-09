@@ -146,7 +146,10 @@ impl Bank {
             unix_timestamp: 0,
         };
         self.put_sysvar(solana_sdk_ids::sysvar::clock::id(), &clock);
-        self.put_sysvar(solana_sdk_ids::sysvar::rent::id(), &solana_rent::Rent::default());
+        self.put_sysvar(
+            solana_sdk_ids::sysvar::rent::id(),
+            &solana_rent::Rent::default(),
+        );
         self.put_sysvar(
             solana_sdk_ids::sysvar::epoch_schedule::id(),
             &solana_epoch_schedule::EpochSchedule::without_warmup(),
@@ -189,9 +192,18 @@ impl Bank {
     /// Register the BPF loader builtins so programs owned by them can execute.
     fn register_loader_builtins(&self) {
         let loaders = [
-            (solana_sdk_ids::bpf_loader::id(), "solana_bpf_loader_program"),
-            (solana_sdk_ids::bpf_loader_deprecated::id(), "solana_bpf_loader_deprecated_program"),
-            (solana_sdk_ids::bpf_loader_upgradeable::id(), "solana_bpf_loader_upgradeable_program"),
+            (
+                solana_sdk_ids::bpf_loader::id(),
+                "solana_bpf_loader_program",
+            ),
+            (
+                solana_sdk_ids::bpf_loader_deprecated::id(),
+                "solana_bpf_loader_deprecated_program",
+            ),
+            (
+                solana_sdk_ids::bpf_loader_upgradeable::id(),
+                "solana_bpf_loader_upgradeable_program",
+            ),
         ];
         for (id, name) in loaders {
             let account = AccountSharedData::from(Account {
@@ -225,7 +237,9 @@ impl Bank {
             executable: true,
             rent_epoch: 0,
         });
-        self.db.set(program_id, &account).map_err(|e| BankError::Storage(e.to_string()))
+        self.db
+            .set(program_id, &account)
+            .map_err(|e| BankError::Storage(e.to_string()))
     }
 
     /// Rent-exempt minimum balance for an account of `space` bytes.
@@ -235,7 +249,9 @@ impl Bank {
 
     /// Latest account-set state root (delegated to the store).
     pub fn state_root(&self) -> Result<[u8; 32], BankError> {
-        self.db.state_root().map_err(|e| BankError::Storage(e.to_string()))
+        self.db
+            .state_root()
+            .map_err(|e| BankError::Storage(e.to_string()))
     }
 
     /// The underlying account store (for snapshotting / state queries).
@@ -266,7 +282,8 @@ impl Bank {
         tx: &Transaction,
         blockhash: Hash,
     ) -> Result<TxOutcome, BankError> {
-        tx.verify().map_err(|e| BankError::BadSignature(e.to_string()))?;
+        tx.verify()
+            .map_err(|e| BankError::BadSignature(e.to_string()))?;
 
         let sanitized = SanitizedTransaction::from_transaction_for_tests(tx.clone());
         let callback = DbCallback { db: &self.db };
@@ -298,7 +315,10 @@ impl Bank {
             &config,
         );
 
-        self.apply_result(&sanitized, output.processing_results.into_iter().next().unwrap())
+        self.apply_result(
+            &sanitized,
+            output.processing_results.into_iter().next().unwrap(),
+        )
     }
 
     fn apply_result(
@@ -318,8 +338,14 @@ impl Bank {
                         .enumerate()
                         .filter(|(i, _)| sanitized.message().is_writable(*i))
                         .map(|(_, (pk, acct))| (pk, acct));
-                    self.db.commit(writes).map_err(|e| BankError::Storage(e.to_string()))?;
-                    Ok(TxOutcome { succeeded: true, fee, error: None })
+                    self.db
+                        .commit(writes)
+                        .map_err(|e| BankError::Storage(e.to_string()))?;
+                    Ok(TxOutcome {
+                        succeeded: true,
+                        fee,
+                        error: None,
+                    })
                 } else {
                     // Program failed: only fee/nonce rollback persists.
                     self.commit_rollback(executed.loaded_transaction.rollback_accounts)?;
@@ -339,7 +365,11 @@ impl Bank {
                     error: Some(format!("{:?}", fees_only.load_error)),
                 })
             }
-            Err(e) => Ok(TxOutcome { succeeded: false, fee: 0, error: Some(format!("{e:?}")) }),
+            Err(e) => Ok(TxOutcome {
+                succeeded: false,
+                fee: 0,
+                error: Some(format!("{e:?}")),
+            }),
         }
     }
 
@@ -349,17 +379,26 @@ impl Bank {
     ) -> Result<(), BankError> {
         // `iter()` yields the fee-payer (and nonce, if any) keyed accounts to
         // persist when a transaction is charged fees but not committed.
-        let changes: Vec<(Pubkey, AccountSharedData)> =
-            rollback.iter().map(|(addr, acct)| (*addr, acct.clone())).collect();
+        let changes: Vec<(Pubkey, AccountSharedData)> = rollback
+            .iter()
+            .map(|(addr, acct)| (*addr, acct.clone()))
+            .collect();
         if !changes.is_empty() {
-            self.db.commit(changes).map_err(|e| BankError::Storage(e.to_string()))?;
+            self.db
+                .commit(changes)
+                .map_err(|e| BankError::Storage(e.to_string()))?;
         }
         Ok(())
     }
 
     /// Read an account's lamport balance (0 if absent).
     pub fn balance(&self, pubkey: &Pubkey) -> u64 {
-        self.db.get(pubkey).ok().flatten().map(|a| a.lamports()).unwrap_or(0)
+        self.db
+            .get(pubkey)
+            .ok()
+            .flatten()
+            .map(|a| a.lamports())
+            .unwrap_or(0)
     }
 
     /// Credit `lamports` to a System-owned account, creating it if absent.
@@ -372,11 +411,11 @@ impl Bank {
             .db
             .get(pubkey)
             .map_err(|e| BankError::Storage(e.to_string()))?
-            .unwrap_or_else(|| {
-                AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id())
-            });
+            .unwrap_or_else(|| AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id()));
         account.set_lamports(account.lamports().saturating_add(lamports));
-        self.db.set(pubkey, &account).map_err(|e| BankError::Storage(e.to_string()))
+        self.db
+            .set(pubkey, &account)
+            .map_err(|e| BankError::Storage(e.to_string()))
     }
 
     /// Execute a block's transactions in order, pay the coinbase
@@ -402,7 +441,11 @@ impl Bank {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "transaction rejected before processing");
-                    outcomes.push(TxOutcome { succeeded: false, fee: 0, error: Some(e.to_string()) });
+                    outcomes.push(TxOutcome {
+                        succeeded: false,
+                        fee: 0,
+                        error: Some(e.to_string()),
+                    });
                 }
             }
         }
@@ -411,7 +454,12 @@ impl Bank {
         self.credit(miner, block_reward.saturating_add(fees))?;
 
         let state_root = self.state_root()?;
-        Ok(BlockExecution { state_root, fees, reward: block_reward, outcomes })
+        Ok(BlockExecution {
+            state_root,
+            fees,
+            reward: block_reward,
+            outcomes,
+        })
     }
 
     /// Credit lamports to an account out-of-band (e.g. a devnet faucet).
@@ -460,8 +508,11 @@ mod tests {
     }
 
     fn fund(db: &AccountsDb, key: &Pubkey, lamports: u64) {
-        db.set(key, &AccountSharedData::new(lamports, 0, &solana_sdk_ids::system_program::id()))
-            .unwrap();
+        db.set(
+            key,
+            &AccountSharedData::new(lamports, 0, &solana_sdk_ids::system_program::id()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -481,12 +532,8 @@ mod tests {
             &recipient.pubkey(),
             amount,
         );
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&payer.pubkey()),
-            &[&payer],
-            blockhash,
-        );
+        let tx =
+            Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], blockhash);
 
         let outcome = bank.execute_transaction(&tx, blockhash).unwrap();
         assert!(outcome.succeeded, "transfer failed: {:?}", outcome.error);
@@ -518,8 +565,14 @@ mod tests {
             let db = tmp_db(tag);
             fund(&db, &payer.pubkey(), 1_000_000_000);
             let bank = Bank::new(db.clone(), 1);
-            let exec = bank.execute_block(&[tx.clone()], blockhash, &miner, reward).unwrap();
-            (exec, bank.balance(&miner), bank.balance(&recipient.pubkey()))
+            let exec = bank
+                .execute_block(&[tx.clone()], blockhash, &miner, reward)
+                .unwrap();
+            (
+                exec,
+                bank.balance(&miner),
+                bank.balance(&recipient.pubkey()),
+            )
         };
 
         let (exec_a, miner_a, recip_a) = run("blk_a");
@@ -530,7 +583,10 @@ mod tests {
         assert_eq!(miner_a, reward + LAMPORTS_PER_SIGNATURE);
 
         let (exec_b, miner_b, _) = run("blk_b");
-        assert_eq!(exec_a.state_root, exec_b.state_root, "non-deterministic state root");
+        assert_eq!(
+            exec_a.state_root, exec_b.state_root,
+            "non-deterministic state root"
+        );
         assert_eq!(miner_a, miner_b);
     }
 
@@ -540,8 +596,10 @@ mod tests {
     use std::str::FromStr;
 
     /// The real, mainnet SPL Token program binary (v3.5.0), deployed on-chain.
-    const SPL_TOKEN_ELF: &[u8] =
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../programs/spl_token.so"));
+    const SPL_TOKEN_ELF: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../programs/spl_token.so"
+    ));
 
     fn spl_token_id() -> Pubkey {
         Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap()
@@ -549,24 +607,47 @@ mod tests {
 
     // Minimal SPL Token instruction encoders (avoid a spl-token crate dep that
     // would fight our locked solana versions). Tags per spl-token 3.x.
-    fn ix_initialize_mint2(token: &Pubkey, mint: &Pubkey, authority: &Pubkey, decimals: u8) -> Instruction {
+    fn ix_initialize_mint2(
+        token: &Pubkey,
+        mint: &Pubkey,
+        authority: &Pubkey,
+        decimals: u8,
+    ) -> Instruction {
         let mut data = vec![20u8, decimals]; // InitializeMint2
         data.extend_from_slice(authority.as_ref());
         data.push(0); // freeze authority COption::None
-        Instruction { program_id: *token, accounts: vec![AccountMeta::new(*mint, false)], data }
-    }
-
-    fn ix_initialize_account3(token: &Pubkey, account: &Pubkey, mint: &Pubkey, owner: &Pubkey) -> Instruction {
-        let mut data = vec![18u8]; // InitializeAccount3
-        data.extend_from_slice(owner.as_ref());
         Instruction {
             program_id: *token,
-            accounts: vec![AccountMeta::new(*account, false), AccountMeta::new_readonly(*mint, false)],
+            accounts: vec![AccountMeta::new(*mint, false)],
             data,
         }
     }
 
-    fn ix_mint_to(token: &Pubkey, mint: &Pubkey, dest: &Pubkey, authority: &Pubkey, amount: u64) -> Instruction {
+    fn ix_initialize_account3(
+        token: &Pubkey,
+        account: &Pubkey,
+        mint: &Pubkey,
+        owner: &Pubkey,
+    ) -> Instruction {
+        let mut data = vec![18u8]; // InitializeAccount3
+        data.extend_from_slice(owner.as_ref());
+        Instruction {
+            program_id: *token,
+            accounts: vec![
+                AccountMeta::new(*account, false),
+                AccountMeta::new_readonly(*mint, false),
+            ],
+            data,
+        }
+    }
+
+    fn ix_mint_to(
+        token: &Pubkey,
+        mint: &Pubkey,
+        dest: &Pubkey,
+        authority: &Pubkey,
+        amount: u64,
+    ) -> Instruction {
         let mut data = vec![7u8]; // MintTo
         data.extend_from_slice(&amount.to_le_bytes());
         Instruction {
@@ -600,7 +681,11 @@ mod tests {
         let tx1 = Transaction::new_signed_with_payer(
             &[
                 solana_system_interface::instruction::create_account(
-                    &payer.pubkey(), &mint.pubkey(), mint_rent, 82, &token,
+                    &payer.pubkey(),
+                    &mint.pubkey(),
+                    mint_rent,
+                    82,
+                    &token,
                 ),
                 ix_initialize_mint2(&token, &mint.pubkey(), &payer.pubkey(), 0),
             ],
@@ -615,21 +700,40 @@ mod tests {
         let tx2 = Transaction::new_signed_with_payer(
             &[
                 solana_system_interface::instruction::create_account(
-                    &payer.pubkey(), &token_account.pubkey(), acct_rent, 165, &token,
+                    &payer.pubkey(),
+                    &token_account.pubkey(),
+                    acct_rent,
+                    165,
+                    &token,
                 ),
-                ix_initialize_account3(&token, &token_account.pubkey(), &mint.pubkey(), &payer.pubkey()),
+                ix_initialize_account3(
+                    &token,
+                    &token_account.pubkey(),
+                    &mint.pubkey(),
+                    &payer.pubkey(),
+                ),
             ],
             Some(&payer.pubkey()),
             &[&payer, &token_account],
             blockhash,
         );
         let o2 = bank.execute_transaction(&tx2, blockhash).unwrap();
-        assert!(o2.succeeded, "create+init token account failed: {:?}", o2.error);
+        assert!(
+            o2.succeeded,
+            "create+init token account failed: {:?}",
+            o2.error
+        );
 
         // 3) Mint 1_000_000 tokens to the token account.
         let amount = 1_000_000u64;
         let tx3 = Transaction::new_signed_with_payer(
-            &[ix_mint_to(&token, &mint.pubkey(), &token_account.pubkey(), &payer.pubkey(), amount)],
+            &[ix_mint_to(
+                &token,
+                &mint.pubkey(),
+                &token_account.pubkey(),
+                &payer.pubkey(),
+                amount,
+            )],
             Some(&payer.pubkey()),
             &[&payer],
             blockhash,

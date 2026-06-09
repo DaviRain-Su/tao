@@ -105,7 +105,11 @@ fn merkle_verify(root: &[u8; 32], leaf: &[u8; 32], proof: &MerkleProof) -> bool 
     let mut h = *leaf;
     let mut idx = proof.index;
     for sib in &proof.siblings {
-        h = if idx & 1 == 0 { node_hash(&h, sib) } else { node_hash(sib, &h) };
+        h = if idx & 1 == 0 {
+            node_hash(&h, sib)
+        } else {
+            node_hash(sib, &h)
+        };
         idx >>= 1;
     }
     &h == root
@@ -251,7 +255,9 @@ impl UtilityGate {
         target: &[u8; 32],
         sol: &BoundSolution,
     ) -> Result<(), GateError> {
-        let model = registry.get(&work.model_id).ok_or(GateError::UnknownModel)?;
+        let model = registry
+            .get(&work.model_id)
+            .ok_or(GateError::UnknownModel)?;
 
         // 1. The solution must be for this exact work item.
         if sol.work_commitment != work.commitment() {
@@ -328,7 +334,11 @@ mod tests {
     /// Build a toy model: `tiles` weight blocks of size n×n, deterministic.
     fn toy_model(n: usize, tiles: usize) -> Vec<Vec<i64>> {
         (0..tiles)
-            .map(|t| (0..n * n).map(|i| ((t * 7 + i * 3) % 17) as i64 - 8).collect())
+            .map(|t| {
+                (0..n * n)
+                    .map(|i| ((t * 7 + i * 3) % 17) as i64 - 8)
+                    .collect()
+            })
             .collect()
     }
 
@@ -341,7 +351,11 @@ mod tests {
 
         let tile_index = 2;
         let input: Vec<i64> = (0..n * n).map(|i| (i % 5) as i64 - 2).collect();
-        let work = WorkItem { model_id, tile_index, input: input.clone() };
+        let work = WorkItem {
+            model_id,
+            tile_index,
+            input: input.clone(),
+        };
 
         let gate = UtilityGate::new(2);
         let proof = reg.tile_proof(&model_id, tile_index).unwrap();
@@ -351,7 +365,10 @@ mod tests {
         assert_eq!(gate.verify(&reg, &work, &easy_target(), &sol), Ok(()));
 
         // The useful output equals the real layer result A·B.
-        assert_eq!(gate.useful_output(&sol, n), gemm::matmul(&weights[tile_index], &input, n));
+        assert_eq!(
+            gate.useful_output(&sol, n),
+            gemm::matmul(&weights[tile_index], &input, n)
+        );
     }
 
     #[test]
@@ -364,7 +381,11 @@ mod tests {
 
         let tile_index = 1;
         let input: Vec<i64> = (0..n * n).map(|i| i as i64 % 3).collect();
-        let work = WorkItem { model_id, tile_index, input };
+        let work = WorkItem {
+            model_id,
+            tile_index,
+            input,
+        };
         let gate = UtilityGate::new(2);
 
         // Miner fabricates random weights but reuses a real tile's proof.
@@ -400,7 +421,13 @@ mod tests {
             input: (0..n * n).map(|_| 1i64).collect(),
         };
         let proof = reg.tile_proof(&model_id, tile_index).unwrap();
-        let sol = gate.solve(n, &other, &easy_target(), weights[tile_index].clone(), proof);
+        let sol = gate.solve(
+            n,
+            &other,
+            &easy_target(),
+            weights[tile_index].clone(),
+            proof,
+        );
 
         // Bound to the wrong work item → rejected.
         assert_eq!(

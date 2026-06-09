@@ -38,7 +38,10 @@ pub struct MatmulPow {
 
 impl MatmulPow {
     pub fn new(n: usize, rank: usize) -> Self {
-        assert!(n > 0 && rank > 0 && rank <= n, "invalid matmul-pouw dimensions");
+        assert!(
+            n > 0 && rank > 0 && rank <= n,
+            "invalid matmul-pouw dimensions"
+        );
         Self { n, rank }
     }
 
@@ -135,11 +138,14 @@ mod tests {
         let mut chain = ChainState::new(genesis, params, pow.clone());
 
         for h in 1..=5u64 {
-            let mut header = chain.build_candidate(Pubkey::default(), 1_000_000 + (h as i64) * 10, &[]);
+            let mut header =
+                chain.build_candidate(Pubkey::default(), 1_000_000 + (h as i64) * 10, &[]);
             while !pow.verify(&header) {
                 header.nonce += 1;
             }
-            chain.add_header(header).expect("block accepted across the switch");
+            chain
+                .add_header(header)
+                .expect("block accepted across the switch");
         }
         assert_eq!(chain.height(), 5);
     }

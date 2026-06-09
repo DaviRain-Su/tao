@@ -71,12 +71,24 @@ mod tests {
         }]);
 
         let first = load_allocations(&genesis, &db).unwrap();
-        assert_eq!(first, GenesisLoad { created: 1, skipped: 0 });
+        assert_eq!(
+            first,
+            GenesisLoad {
+                created: 1,
+                skipped: 0
+            }
+        );
         assert_eq!(db.get(&addr).unwrap().unwrap().lamports(), 5_000_000);
 
         // Second run skips the existing account (no balance reset).
         let second = load_allocations(&genesis, &db).unwrap();
-        assert_eq!(second, GenesisLoad { created: 0, skipped: 1 });
+        assert_eq!(
+            second,
+            GenesisLoad {
+                created: 0,
+                skipped: 1
+            }
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

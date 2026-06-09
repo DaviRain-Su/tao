@@ -24,7 +24,7 @@ use tao_consensus::{
 };
 use tao_core::{genesis::GenesisConfig, Hash};
 use tao_database::{AccountsDb, BlockLog};
-use tao_p2p::{NetMsg, Network};
+use tao_p2p::{InboundMsg, NetMsg, Network};
 use tao_runtime::{load_allocations, Bank};
 
 use crate::shared::Shared;
@@ -165,7 +165,7 @@ impl Miner {
         shared: Arc<Shared>,
         shutdown: Arc<AtomicBool>,
         network: Option<Network>,
-        inbound: Option<Receiver<NetMsg>>,
+        inbound: Option<Receiver<InboundMsg>>,
     ) -> anyhow::Result<()> {
         let mode = if self.mine { "miner" } else { "follower" };
         tracing::info!(
@@ -188,6 +188,7 @@ impl Miner {
             let mut did_work = false;
             if let Some(rx) = &inbound {
                 while let Ok(msg) = rx.try_recv() {
+                    let InboundMsg { msg, .. } = msg;
                     match msg {
                         NetMsg::NewBlock(bytes) => {
                             self.apply_peer_block(&bytes, &shared)?;

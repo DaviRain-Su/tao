@@ -75,9 +75,8 @@ impl GenesisConfig {
                 target_block_time_secs: 10,
                 lwma_window: 90,
                 // Easy starting target (top byte zero) for CPU mining on a laptop.
-                initial_target:
-                    "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-                        .to_string(),
+                initial_target: "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_string(),
             },
             reward: RewardParams {
                 initial_lamports: 1_000_000_000, // 1 TAO (9 decimals, Solana-style)

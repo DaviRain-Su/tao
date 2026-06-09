@@ -40,11 +40,20 @@ impl DagVm {
         let bank = Bank::new(accounts, 0);
         let engine = DagEngine::new(k, genesis);
         engine.add_block(genesis, &[blockhash::ORIGIN]);
-        Self { engine, bank, block_txs: HashMap::new() }
+        Self {
+            engine,
+            bank,
+            block_txs: HashMap::new(),
+        }
     }
 
     /// Add a block referencing `parents`, carrying `transactions`.
-    pub fn add_block(&mut self, hash: DagHash, parents: &[DagHash], transactions: Vec<Transaction>) {
+    pub fn add_block(
+        &mut self,
+        hash: DagHash,
+        parents: &[DagHash],
+        transactions: Vec<Transaction>,
+    ) {
         self.engine.add_block(hash, parents);
         if !transactions.is_empty() {
             self.block_txs.insert(hash, transactions);
@@ -93,7 +102,11 @@ mod tests {
     }
 
     fn fund(db: &AccountsDb, key: &Pubkey, lamports: u64) {
-        db.set(key, &AccountSharedData::new(lamports, 0, &solana_sdk_ids::system_program::id())).unwrap();
+        db.set(
+            key,
+            &AccountSharedData::new(lamports, 0, &solana_sdk_ids::system_program::id()),
+        )
+        .unwrap();
     }
 
     fn transfer(from: &Keypair, to: &Pubkey, lamports: u64, bh: Blockhash) -> Transaction {
@@ -116,8 +129,16 @@ mod tests {
             fund(&db, &payer.pubkey(), 1_000_000_000);
             let mut vm = DagVm::new(3, DagHash::from(1), db);
             // 2 and 3 are parallel children of genesis; 4 merges both.
-            vm.add_block(DagHash::from(2), &[DagHash::from(1)], vec![transfer(&payer, &a.pubkey(), 100_000_000, bh)]);
-            vm.add_block(DagHash::from(3), &[DagHash::from(1)], vec![transfer(&payer, &b.pubkey(), 50_000_000, bh)]);
+            vm.add_block(
+                DagHash::from(2),
+                &[DagHash::from(1)],
+                vec![transfer(&payer, &a.pubkey(), 100_000_000, bh)],
+            );
+            vm.add_block(
+                DagHash::from(3),
+                &[DagHash::from(1)],
+                vec![transfer(&payer, &b.pubkey(), 50_000_000, bh)],
+            );
             // Block 4 spends from A — only valid because block 2 (funding A) is
             // ordered before it by GHOSTDAG.
             vm.add_block(
@@ -126,15 +147,31 @@ mod tests {
                 vec![transfer(&a, &b.pubkey(), 10_000_000, bh)],
             );
             let root = vm.execute_linear(bh).unwrap();
-            (root, vm.bank().balance(&a.pubkey()), vm.bank().balance(&b.pubkey()), vm.bank().balance(&payer.pubkey()))
+            (
+                root,
+                vm.bank().balance(&a.pubkey()),
+                vm.bank().balance(&b.pubkey()),
+                vm.bank().balance(&payer.pubkey()),
+            )
         };
 
         let (root1, a_bal, b_bal, payer_bal) = run("run1");
-        assert_eq!(a_bal, 100_000_000 - 10_000_000 - 5_000, "A: funded then spent + fee");
+        assert_eq!(
+            a_bal,
+            100_000_000 - 10_000_000 - 5_000,
+            "A: funded then spent + fee"
+        );
         assert_eq!(b_bal, 60_000_000, "B: from payer + from A");
-        assert_eq!(payer_bal, 1_000_000_000 - 150_000_000 - 2 * 5_000, "payer: two transfers + fees");
+        assert_eq!(
+            payer_bal,
+            1_000_000_000 - 150_000_000 - 2 * 5_000,
+            "payer: two transfers + fees"
+        );
 
         let (root2, ..) = run("run2");
-        assert_eq!(root1, root2, "same DAG → same linear order → same state root");
+        assert_eq!(
+            root1, root2,
+            "same DAG → same linear order → same state root"
+        );
     }
 }

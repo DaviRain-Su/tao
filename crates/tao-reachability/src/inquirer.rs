@@ -37,7 +37,14 @@ pub fn add_block(
     selected_parent: Hash,
     mergeset_iterator: HashIterator,
 ) -> Result<()> {
-    add_block_with_params(store, new_block, selected_parent, mergeset_iterator, None, None)
+    add_block_with_params(
+        store,
+        new_block,
+        selected_parent,
+        mergeset_iterator,
+        None,
+        None,
+    )
 }
 
 fn add_block_with_params(
@@ -80,13 +87,14 @@ pub fn delete_block(
     let parent = store.get_parent(block)?;
     let children = store.get_children(block)?;
 
-    let block_index = match binary_search_descendant(store, store.get_children(parent)?.as_slice(), block)? {
-        SearchOutput::NotFound(_) => return Err(ReachabilityError::DataInconsistency),
-        SearchOutput::Found(hash, i) => {
-            debug_assert_eq!(hash, block);
-            i
-        }
-    };
+    let block_index =
+        match binary_search_descendant(store, store.get_children(parent)?.as_slice(), block)? {
+            SearchOutput::NotFound(_) => return Err(ReachabilityError::DataInconsistency),
+            SearchOutput::Found(hash, i) => {
+                debug_assert_eq!(hash, block);
+                i
+            }
+        };
 
     store.replace_child(parent, block, block_index, &children)?;
 
@@ -95,7 +103,11 @@ pub fn delete_block(
     }
 
     for merged_block in mergeset_iterator {
-        match binary_search_descendant(store, store.get_future_covering_set(merged_block)?.as_slice(), block)? {
+        match binary_search_descendant(
+            store,
+            store.get_future_covering_set(merged_block)?.as_slice(),
+            block,
+        )? {
             SearchOutput::NotFound(_) => return Err(ReachabilityError::DataInconsistency),
             SearchOutput::Found(hash, i) => {
                 debug_assert_eq!(hash, block);
@@ -118,7 +130,10 @@ pub fn delete_block(
         _ => {
             let first_child = children[0];
             let first_interval = store.get_interval(first_child)?;
-            store.set_interval(first_child, Interval::new(interval.start, first_interval.end))?;
+            store.set_interval(
+                first_child,
+                Interval::new(interval.start, first_interval.end),
+            )?;
 
             let last_child = children.last().copied().expect("len > 1");
             let last_interval = store.get_interval(last_child)?;
@@ -135,7 +150,11 @@ fn insert_to_future_covering_set(
     merged_block: Hash,
     new_block: Hash,
 ) -> Result<()> {
-    match binary_search_descendant(store, store.get_future_covering_set(merged_block)?.as_slice(), new_block)? {
+    match binary_search_descendant(
+        store,
+        store.get_future_covering_set(merged_block)?.as_slice(),
+        new_block,
+    )? {
         SearchOutput::Found(_, _) => Err(ReachabilityError::DataInconsistency),
         SearchOutput::NotFound(i) => {
             store.insert_future_covering_item(merged_block, new_block, i)?;
@@ -146,7 +165,10 @@ fn insert_to_future_covering_set(
 
 /// Hint that `hint` is a candidate to become the virtual selected parent; this
 /// may advance the internal reindex root.
-pub fn hint_virtual_selected_parent(store: &mut (impl ReachabilityStore + ?Sized), hint: Hash) -> Result<()> {
+pub fn hint_virtual_selected_parent(
+    store: &mut (impl ReachabilityStore + ?Sized),
+    hint: Hash,
+) -> Result<()> {
     try_advancing_reindex_root(
         store,
         hint,
@@ -161,7 +183,9 @@ pub fn is_strict_chain_ancestor_of(
     this: Hash,
     queried: Hash,
 ) -> Result<bool> {
-    Ok(store.get_interval(this)?.strictly_contains(store.get_interval(queried)?))
+    Ok(store
+        .get_interval(this)?
+        .strictly_contains(store.get_interval(queried)?))
 }
 
 /// Is `this` a chain ancestor of `queried` (`this ∈ chain(queried) ∪ {queried}`)? O(1).
@@ -170,7 +194,9 @@ pub fn is_chain_ancestor_of(
     this: Hash,
     queried: Hash,
 ) -> Result<bool> {
-    Ok(store.get_interval(this)?.contains(store.get_interval(queried)?))
+    Ok(store
+        .get_interval(this)?
+        .contains(store.get_interval(queried)?))
 }
 
 /// Is `this` a DAG ancestor of `queried` (`queried ∈ future(this) ∪ {this}`)?
@@ -183,7 +209,11 @@ pub fn is_dag_ancestor_of(
     if is_chain_ancestor_of(store, this, queried)? {
         return Ok(true);
     }
-    match binary_search_descendant(store, store.get_future_covering_set(this)?.as_slice(), queried)? {
+    match binary_search_descendant(
+        store,
+        store.get_future_covering_set(this)?.as_slice(),
+        queried,
+    )? {
         SearchOutput::Found(_, _) => Ok(true),
         SearchOutput::NotFound(_) => Ok(false),
     }
@@ -246,6 +276,13 @@ fn binary_search_descendant(
 }
 
 fn assert_hashes_ordered(store: &(impl ReachabilityStoreReader + ?Sized), ordered_hashes: &[Hash]) {
-    let intervals: Vec<Interval> = ordered_hashes.iter().cloned().map(|c| store.get_interval(c).unwrap()).collect();
-    debug_assert!(intervals.as_slice().windows(2).all(|w| w[0].end < w[1].start))
+    let intervals: Vec<Interval> = ordered_hashes
+        .iter()
+        .cloned()
+        .map(|c| store.get_interval(c).unwrap())
+        .collect();
+    debug_assert!(intervals
+        .as_slice()
+        .windows(2)
+        .all(|w| w[0].end < w[1].start))
 }

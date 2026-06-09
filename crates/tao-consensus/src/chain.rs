@@ -62,18 +62,30 @@ pub struct ChainState {
 impl ChainState {
     /// Create a new chain initialized at `genesis`. The genesis PoW is not
     /// checked (it is a fixed protocol constant).
-    pub fn new(
-        genesis: BlockHeader,
-        params: DifficultyParams,
-        pow: Arc<dyn PowAlgorithm>,
-    ) -> Self {
-        assert!(genesis.is_genesis(), "genesis header must be at height 0 with zero prev_hash");
+    pub fn new(genesis: BlockHeader, params: DifficultyParams, pow: Arc<dyn PowAlgorithm>) -> Self {
+        assert!(
+            genesis.is_genesis(),
+            "genesis header must be at height 0 with zero prev_hash"
+        );
         let id = genesis.id();
         let genesis_target = genesis.target;
         let work = work_for_target(&genesis.target);
         let mut blocks = HashMap::new();
-        blocks.insert(id, Entry { header: genesis, cumulative_work: work });
-        Self { blocks, tip: id, genesis: id, params, genesis_target, pow }
+        blocks.insert(
+            id,
+            Entry {
+                header: genesis,
+                cumulative_work: work,
+            },
+        );
+        Self {
+            blocks,
+            tip: id,
+            genesis: id,
+            params,
+            genesis_target,
+            pow,
+        }
     }
 
     pub fn genesis_id(&self) -> BlockId {
@@ -141,7 +153,9 @@ impl ChainState {
         let mut out = Vec::with_capacity(count);
         let mut cur = from;
         for _ in 0..count {
-            let Some(entry) = self.blocks.get(&cur) else { break };
+            let Some(entry) = self.blocks.get(&cur) else {
+                break;
+            };
             out.push(entry.header.clone());
             if entry.header.is_genesis() {
                 break;
@@ -159,7 +173,10 @@ impl ChainState {
             return Err(ChainError::Duplicate);
         }
         let parent_id = hash_to_id(&header.prev_hash);
-        let parent = self.blocks.get(&parent_id).ok_or(ChainError::UnknownParent)?;
+        let parent = self
+            .blocks
+            .get(&parent_id)
+            .ok_or(ChainError::UnknownParent)?;
 
         // Structural checks.
         if header.height != parent.header.height + 1 {
@@ -185,7 +202,13 @@ impl ChainState {
         }
 
         let cumulative_work = parent.cumulative_work + work_for_target(&header.target);
-        self.blocks.insert(id, Entry { header, cumulative_work });
+        self.blocks.insert(
+            id,
+            Entry {
+                header,
+                cumulative_work,
+            },
+        );
 
         // Fork choice: heaviest cumulative work wins; ties keep the incumbent.
         if cumulative_work > self.blocks[&self.tip].cumulative_work {
@@ -194,7 +217,10 @@ impl ChainState {
             if hash_to_id(&self.blocks[&id].header.prev_hash) == old_tip {
                 Ok(BlockStatus::ExtendedTip)
             } else {
-                Ok(BlockStatus::Reorg { old_tip, new_tip: id })
+                Ok(BlockStatus::Reorg {
+                    old_tip,
+                    new_tip: id,
+                })
             }
         } else {
             Ok(BlockStatus::SideChain)
@@ -238,8 +264,7 @@ mod tests {
     fn mine_child(chain: &ChainState, parent: &BlockHeader, timestamp: i64) -> BlockHeader {
         let pow = Blake3Pow;
         let target = {
-            let recent =
-                chain.recent_headers(parent.id(), chain.params.window as usize + 1);
+            let recent = chain.recent_headers(parent.id(), chain.params.window as usize + 1);
             next_target(&recent, &chain.params, &chain.genesis_target)
         };
         let mut header = BlockHeader {
@@ -280,7 +305,10 @@ mod tests {
         let mut orphan = mine_child(&chain, chain.tip_header(), 1_000_020);
         orphan.prev_hash = Hash::new_from_array([9u8; 32]);
         // recompute pow not needed; parent lookup fails first
-        assert_eq!(chain.add_header(orphan).unwrap_err(), ChainError::UnknownParent);
+        assert_eq!(
+            chain.add_header(orphan).unwrap_err(),
+            ChainError::UnknownParent
+        );
     }
 
     #[test]
@@ -295,7 +323,10 @@ mod tests {
 
         // Branch B: two blocks on genesis → heavier → should win.
         let b1 = mine_child(&chain, &g, 1_000_011);
-        assert_eq!(chain.add_header(b1.clone()).unwrap(), BlockStatus::SideChain);
+        assert_eq!(
+            chain.add_header(b1.clone()).unwrap(),
+            BlockStatus::SideChain
+        );
         let b2 = mine_child(&chain, &b1, 1_000_021);
         let status = chain.add_header(b2.clone()).unwrap();
         assert!(matches!(status, BlockStatus::Reorg { .. }));

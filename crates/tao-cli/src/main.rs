@@ -75,19 +75,28 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Airdrop { pubkey, lamports } => {
             let sig = rpc_call(rpc, "requestAirdrop", json!([pubkey, lamports]))?;
-            let sig = sig.as_str().ok_or_else(|| anyhow!("bad airdrop signature"))?;
+            let sig = sig
+                .as_str()
+                .ok_or_else(|| anyhow!("bad airdrop signature"))?;
             println!("airdrop signature: {sig}");
             confirm(rpc, sig)?;
             println!("confirmed");
             Ok(())
         }
-        Command::Transfer { keypair, to, lamports } => transfer(rpc, &keypair, &to, lamports),
+        Command::Transfer {
+            keypair,
+            to,
+            lamports,
+        } => transfer(rpc, &keypair, &to, lamports),
     }
 }
 
 fn keygen(outfile: &PathBuf, force: bool) -> anyhow::Result<()> {
     if outfile.exists() && !force {
-        bail!("{} already exists (use --force to overwrite)", outfile.display());
+        bail!(
+            "{} already exists (use --force to overwrite)",
+            outfile.display()
+        );
     }
     let kp = Keypair::new();
     let bytes = kp.to_bytes().to_vec();
@@ -108,7 +117,9 @@ fn transfer(rpc: &str, keypair: &PathBuf, to: &str, lamports: u64) -> anyhow::Re
     let to = Pubkey::from_str(to).map_err(|e| anyhow!("bad recipient: {e}"))?;
 
     let bh = rpc_call(rpc, "getLatestBlockhash", json!([]))?;
-    let bh_str = bh["value"]["blockhash"].as_str().ok_or_else(|| anyhow!("no blockhash"))?;
+    let bh_str = bh["value"]["blockhash"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no blockhash"))?;
     let bh_bytes: [u8; 32] = bs58::decode(bh_str)
         .into_vec()?
         .as_slice()

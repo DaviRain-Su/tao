@@ -33,7 +33,9 @@ impl PartialOrd for SortableBlock {
 }
 impl Ord for SortableBlock {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.blue_work.cmp(&other.blue_work).then_with(|| self.hash.cmp(&other.hash))
+        self.blue_work
+            .cmp(&other.blue_work)
+            .then_with(|| self.hash.cmp(&other.hash))
     }
 }
 
@@ -57,7 +59,14 @@ impl GhostdagData {
         mergeset_reds: BlockHashes,
         blues_anticone_sizes: HashKTypeMap,
     ) -> Self {
-        Self { blue_score, blue_work, selected_parent, mergeset_blues, mergeset_reds, blues_anticone_sizes }
+        Self {
+            blue_score,
+            blue_work,
+            selected_parent,
+            mergeset_blues,
+            mergeset_reds,
+            blues_anticone_sizes,
+        }
     }
 
     pub fn new_with_selected_parent(selected_parent: Hash, k: KType) -> Self {
@@ -77,10 +86,19 @@ impl GhostdagData {
 
     /// Mergeset (excluding the selected parent), unordered.
     pub fn unordered_mergeset_without_selected_parent(&self) -> impl Iterator<Item = Hash> + '_ {
-        self.mergeset_blues.iter().skip(1).cloned().chain(self.mergeset_reds.iter().cloned())
+        self.mergeset_blues
+            .iter()
+            .skip(1)
+            .cloned()
+            .chain(self.mergeset_reds.iter().cloned())
     }
 
-    fn add_blue(&mut self, block: Hash, blue_anticone_size: KType, block_blues_anticone_sizes: &BlockHashMap<KType>) {
+    fn add_blue(
+        &mut self,
+        block: Hash,
+        blue_anticone_size: KType,
+        block_blues_anticone_sizes: &BlockHashMap<KType>,
+    ) {
         Arc::make_mut(&mut self.mergeset_blues).push(block);
         let blues_anticone_sizes = Arc::make_mut(&mut self.blues_anticone_sizes);
         blues_anticone_sizes.insert(block, blue_anticone_size);
@@ -101,7 +119,12 @@ impl GhostdagData {
 
 /// The GHOSTDAG protocol manager (generic over the stores + reachability service).
 #[derive(Clone)]
-pub struct GhostdagManager<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W: WorkStore> {
+pub struct GhostdagManager<
+    T: GhostdagStoreReader,
+    S: RelationsStoreReader,
+    U: ReachabilityService,
+    W: WorkStore,
+> {
     genesis_hash: Hash,
     k: KType,
     ghostdag_store: Arc<T>,
@@ -121,7 +144,14 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W:
         reachability_service: U,
         work_store: W,
     ) -> Self {
-        Self { genesis_hash, k, ghostdag_store, relations_store, reachability_service, work_store }
+        Self {
+            genesis_hash,
+            k,
+            ghostdag_store,
+            relations_store,
+            reachability_service,
+            work_store,
+        }
     }
 
     /// GHOSTDAG data for the ORIGIN sentinel (parent of genesis).
@@ -139,7 +169,10 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W:
     pub fn find_selected_parent(&self, parents: impl IntoIterator<Item = Hash>) -> Hash {
         parents
             .into_iter()
-            .map(|parent| SortableBlock { hash: parent, blue_work: self.ghostdag_store.get_blue_work(parent).unwrap() })
+            .map(|parent| SortableBlock {
+                hash: parent,
+                blue_work: self.ghostdag_store.get_blue_work(parent).unwrap(),
+            })
             .max()
             .unwrap()
             .hash
@@ -156,33 +189,55 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W:
         }
         let k = self.k;
         let mut new_block_data = GhostdagData::new_with_selected_parent(selected_parent, k);
-        let ordered_mergeset = self.ordered_mergeset_without_selected_parent(selected_parent, parents);
+        let ordered_mergeset =
+            self.ordered_mergeset_without_selected_parent(selected_parent, parents);
 
         for blue_candidate in ordered_mergeset.iter().cloned() {
             match self.check_blue_candidate(&new_block_data, blue_candidate, k) {
                 ColoringOutput::Blue(blue_anticone_size, blues_anticone_sizes) => {
-                    new_block_data.add_blue(blue_candidate, blue_anticone_size, &blues_anticone_sizes);
+                    new_block_data.add_blue(
+                        blue_candidate,
+                        blue_anticone_size,
+                        &blues_anticone_sizes,
+                    );
                 }
                 ColoringOutput::Red => new_block_data.add_red(blue_candidate),
             }
         }
 
-        let blue_score =
-            self.ghostdag_store.get_blue_score(selected_parent).unwrap() + new_block_data.mergeset_blues.len() as u64;
-        let added_blue_work: BlueWork =
-            new_block_data.mergeset_blues.iter().cloned().map(|h| self.work_store.get_work(h)).sum();
-        let blue_work = self.ghostdag_store.get_blue_work(selected_parent).unwrap() + added_blue_work;
+        let blue_score = self.ghostdag_store.get_blue_score(selected_parent).unwrap()
+            + new_block_data.mergeset_blues.len() as u64;
+        let added_blue_work: BlueWork = new_block_data
+            .mergeset_blues
+            .iter()
+            .cloned()
+            .map(|h| self.work_store.get_work(h))
+            .sum();
+        let blue_work =
+            self.ghostdag_store.get_blue_work(selected_parent).unwrap() + added_blue_work;
 
         new_block_data.finalize_score_and_work(blue_score, blue_work);
         new_block_data
     }
 
-    fn ordered_mergeset_without_selected_parent(&self, selected_parent: Hash, parents: &[Hash]) -> Vec<Hash> {
+    fn ordered_mergeset_without_selected_parent(
+        &self,
+        selected_parent: Hash,
+        parents: &[Hash],
+    ) -> Vec<Hash> {
         self.sort_blocks(self.unordered_mergeset_without_selected_parent(selected_parent, parents))
     }
 
-    fn unordered_mergeset_without_selected_parent(&self, selected_parent: Hash, parents: &[Hash]) -> Vec<Hash> {
-        let mut queue: VecDeque<Hash> = parents.iter().copied().filter(|p| *p != selected_parent).collect();
+    fn unordered_mergeset_without_selected_parent(
+        &self,
+        selected_parent: Hash,
+        parents: &[Hash],
+    ) -> Vec<Hash> {
+        let mut queue: VecDeque<Hash> = parents
+            .iter()
+            .copied()
+            .filter(|p| *p != selected_parent)
+            .collect();
         let mut mergeset: HashSet<Hash> = queue.iter().copied().collect();
         let mut past: HashSet<Hash> = HashSet::new();
 
@@ -192,7 +247,10 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W:
                 if mergeset.contains(parent) || past.contains(parent) {
                     continue;
                 }
-                if self.reachability_service.is_dag_ancestor_of(*parent, selected_parent) {
+                if self
+                    .reachability_service
+                    .is_dag_ancestor_of(*parent, selected_parent)
+                {
                     past.insert(*parent);
                     continue;
                 }
@@ -224,13 +282,19 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W:
         // If blue_candidate is in the future of chain_block, all remaining blues
         // are in its past — mark blue.
         if let Some(hash) = chain_block.hash {
-            if self.reachability_service.is_dag_ancestor_of(hash, blue_candidate) {
+            if self
+                .reachability_service
+                .is_dag_ancestor_of(hash, blue_candidate)
+            {
                 return ColoringState::Blue;
             }
         }
 
         for &peer in chain_block.data.mergeset_blues.iter() {
-            if self.reachability_service.is_dag_ancestor_of(peer, blue_candidate) {
+            if self
+                .reachability_service
+                .is_dag_ancestor_of(peer, blue_candidate)
+            {
                 continue; // peer is in the past of the candidate, not its anticone
             }
 
@@ -244,7 +308,10 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W:
             if peer_blue_anticone_size == k {
                 return ColoringState::Red;
             }
-            assert!(peer_blue_anticone_size <= k, "found blue anticone larger than K");
+            assert!(
+                peer_blue_anticone_size <= k,
+                "found blue anticone larger than K"
+            );
         }
 
         ColoringState::Pending
@@ -258,22 +325,39 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W:
             if let Some(size) = current_blues_anticone_sizes.get(&block) {
                 return *size;
             }
-            if current_selected_parent == self.genesis_hash || current_selected_parent == blockhash::ORIGIN {
+            if current_selected_parent == self.genesis_hash
+                || current_selected_parent == blockhash::ORIGIN
+            {
                 panic!("block {block} is not in blue set of the given context");
             }
-            current_blues_anticone_sizes = self.ghostdag_store.get_blues_anticone_sizes(current_selected_parent).unwrap();
-            current_selected_parent = self.ghostdag_store.get_selected_parent(current_selected_parent).unwrap();
+            current_blues_anticone_sizes = self
+                .ghostdag_store
+                .get_blues_anticone_sizes(current_selected_parent)
+                .unwrap();
+            current_selected_parent = self
+                .ghostdag_store
+                .get_selected_parent(current_selected_parent)
+                .unwrap();
         }
     }
 
-    fn check_blue_candidate(&self, new_block_data: &GhostdagData, blue_candidate: Hash, k: KType) -> ColoringOutput {
+    fn check_blue_candidate(
+        &self,
+        new_block_data: &GhostdagData,
+        blue_candidate: Hash,
+        k: KType,
+    ) -> ColoringOutput {
         // mergeset_blues can be at most K+1 (it includes the selected parent).
         if new_block_data.mergeset_blues.len() as KType == k + 1 {
             return ColoringOutput::Red;
         }
 
-        let mut candidate_blues_anticone_sizes: BlockHashMap<KType> = BlockHashMap::with_capacity(k as usize);
-        let mut chain_block = ChainBlock { hash: None, data: Arc::new(new_block_data.clone()) };
+        let mut candidate_blues_anticone_sizes: BlockHashMap<KType> =
+            BlockHashMap::with_capacity(k as usize);
+        let mut chain_block = ChainBlock {
+            hash: None,
+            data: Arc::new(new_block_data.clone()),
+        };
         let mut candidate_blue_anticone_size: KType = 0;
 
         loop {
@@ -287,13 +371,19 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, W:
             );
             match state {
                 ColoringState::Blue => {
-                    return ColoringOutput::Blue(candidate_blue_anticone_size, candidate_blues_anticone_sizes)
+                    return ColoringOutput::Blue(
+                        candidate_blue_anticone_size,
+                        candidate_blues_anticone_sizes,
+                    )
                 }
                 ColoringState::Red => return ColoringOutput::Red,
                 ColoringState::Pending => (),
             }
             let sp = chain_block.data.selected_parent;
-            chain_block = ChainBlock { hash: Some(sp), data: self.ghostdag_store.get_data(sp).unwrap() };
+            chain_block = ChainBlock {
+                hash: Some(sp),
+                data: self.ghostdag_store.get_data(sp).unwrap(),
+            };
         }
     }
 }

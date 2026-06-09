@@ -25,8 +25,14 @@ pub struct DifficultyParams {
 
 impl DifficultyParams {
     pub fn new(target_block_time_secs: u64, window: u64) -> Self {
-        assert!(target_block_time_secs > 0 && window >= 2, "invalid difficulty params");
-        Self { target_block_time_secs, window }
+        assert!(
+            target_block_time_secs > 0 && window >= 2,
+            "invalid difficulty params"
+        );
+        Self {
+            target_block_time_secs,
+            window,
+        }
     }
 }
 
@@ -68,9 +74,7 @@ pub fn next_target(
     let weighted_time = weighted_time.max(1) as u64;
 
     // next_difficulty = avg_difficulty * k / weighted_time
-    let next_difficulty = avg_difficulty
-        .saturating_mul(U256::from(k))
-        / U256::from(weighted_time);
+    let next_difficulty = avg_difficulty.saturating_mul(U256::from(k)) / U256::from(weighted_time);
 
     difficulty_to_target(next_difficulty)
 }

@@ -44,9 +44,18 @@ impl DagEngine {
         let gd = Arc::new(MemoryGhostdagStore::new());
         let relations = Arc::new(MemoryRelationsStore::new());
         let service = MtReachabilityService::new(reach.clone());
-        let manager = GhostdagManager::new(genesis, k, gd.clone(), relations.clone(), service, UnitWork);
-        gd.insert(blockhash::ORIGIN, manager.origin_ghostdag_data()).unwrap();
-        Self { genesis, reach, gd, relations, manager, tip: RefCell::new(genesis) }
+        let manager =
+            GhostdagManager::new(genesis, k, gd.clone(), relations.clone(), service, UnitWork);
+        gd.insert(blockhash::ORIGIN, manager.origin_ghostdag_data())
+            .unwrap();
+        Self {
+            genesis,
+            reach,
+            gd,
+            relations,
+            manager,
+            tip: RefCell::new(genesis),
+        }
     }
 
     /// Add a block referencing `parents`. Runs GHOSTDAG, updates the
@@ -64,7 +73,8 @@ impl DagEngine {
 
         let data = Arc::new(data);
         self.gd.insert(block, data.clone()).unwrap();
-        self.relations.insert(block, BlockHashes::new(parents.to_vec()));
+        self.relations
+            .insert(block, BlockHashes::new(parents.to_vec()));
 
         // Advance the tip (heaviest blue work, ties by larger hash).
         let mut tip = self.tip.borrow_mut();

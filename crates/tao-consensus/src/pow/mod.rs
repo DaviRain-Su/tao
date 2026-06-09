@@ -52,7 +52,11 @@ impl HeightSwitchPow {
         after: Arc<dyn PowAlgorithm>,
         activation_height: u64,
     ) -> Self {
-        Self { before, after, activation_height }
+        Self {
+            before,
+            after,
+            activation_height,
+        }
     }
 
     fn active(&self, height: u64) -> &Arc<dyn PowAlgorithm> {

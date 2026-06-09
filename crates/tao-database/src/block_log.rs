@@ -28,7 +28,10 @@ impl BlockLog {
             .append(true)
             .read(true)
             .open(&path)?;
-        Ok(Self { path, writer: Mutex::new(writer) })
+        Ok(Self {
+            path,
+            writer: Mutex::new(writer),
+        })
     }
 
     /// Append one serialized block record, flushing to disk.
@@ -49,23 +52,29 @@ impl BlockLog {
     /// or the new log intact, never a partial one. The internal writer is
     /// repointed at the compacted file for subsequent appends.
     pub fn replace_all(&self, records: &[Vec<u8>]) -> Result<()> {
-        let tmp = self.path.with_extension("log.compact");
-        {
-            let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
-            for payload in records {
-                let len: u32 = payload
-                    .len()
-                    .try_into()
-                    .map_err(|_| TaoError::Storage("block too large for log record".into()))?;
-                f.write_all(&len.to_be_bytes())?;
-                f.write_all(payload)?;
-            }
-            f.flush()?;
-        }
         let mut writer = self.writer.lock().expect("block log mutex poisoned");
+        let tmp = self.path.with_extension("log.compact");
+        let mut temp = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        for payload in records {
+            let len: u32 = payload
+                .len()
+                .try_into()
+                .map_err(|_| TaoError::Storage("block too large for log record".into()))?;
+            temp.write_all(&len.to_be_bytes())?;
+            temp.write_all(payload)?;
+        }
+        temp.flush()?;
         std::fs::rename(&tmp, &self.path)?;
         // Repoint the append handle at the compacted file.
-        *writer = OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        *writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&self.path)?;
         Ok(())
     }
 
@@ -83,9 +92,9 @@ impl BlockLog {
             }
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut payload = vec![0u8; len];
-            reader.read_exact(&mut payload).map_err(|e| {
-                TaoError::Storage(format!("truncated block log record: {e}"))
-            })?;
+            reader
+                .read_exact(&mut payload)
+                .map_err(|e| TaoError::Storage(format!("truncated block log record: {e}")))?;
             records.push(payload);
         }
         Ok(records)
