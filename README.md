@@ -140,9 +140,20 @@ tao balance $(tao address -k wallet.json)
     rejected by the Merkle check. Verified by tests (accepts real work + returns
     `A·B`; rejects the random-matrix attack).
 
-**M0–M6 complete; M7 prototyped.** Remaining (per `docs/PLAN.md`): M7
-production (GPU + ZK + utility gate), M8 — blockDAG/GHOSTDAG; plus networking
-hardening (libp2p, IBD, multi-miner reorgs) and a real RandomX CPU phase.
+- **M8 — blockDAG / GHOSTDAG — prototype ✓** `tao-dag` implements the core of
+  Kaspa's consensus: blocks reference multiple parents, and GHOSTDAG classifies
+  every block **blue** (well-connected) or **red** (mined ignoring too much of
+  the DAG) via the k-cluster rule, then produces a deterministic **total order**.
+  Tests show a linear chain stays all-blue, `k=0` degenerates to longest-chain, a
+  diamond merges the parallel block as blue, and a block that ignores the DAG is
+  marked red. *Prototype = explicit `past` sets, `u64` ids.* Production needs an
+  efficient reachability index, pruning, and feeding the linear order into the
+  SVM (the "Case B" linearization).
+
+**M0–M6 complete; M7 (matmul-PoUW + utility gate) and M8 (GHOSTDAG) prototyped.**
+Remaining (per `docs/PLAN.md`): production-hardening these research tracks (GPU
+kernels, Plonky2 ZK, reachability/pruning, SVM-on-DAG), plus libp2p/IBD/
+multi-miner reorgs and a real RandomX CPU phase.
 
 ## License
 
