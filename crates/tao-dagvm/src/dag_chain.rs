@@ -983,8 +983,23 @@ impl DagChain {
         let p_dag = DagHash::from_bytes(p);
 
         // Build the retained NiPoPoW proof for P *before* its ancestors are
-        // dropped (chaining onto any existing proof so it stays genesis-anchored).
-        let new_proof = self.build_proof_for(p);
+        // dropped. The walk reaches the current origin; if we have pruned before,
+        // its ancestors below the current origin are already gone, so the walk
+        // only spans current-origin→P. Chain it onto the retained proof
+        // (genesis→current-origin) so the combined proof stays genesis-anchored.
+        let walk = self.build_proof_for(p);
+        let new_proof = if self.history_pruned && !self.proof.is_empty() {
+            let seen: HashSet<[u8; 32]> = self.proof.iter().map(|h| h.id()).collect();
+            let mut combined = self.proof.clone(); // genesis → current origin
+            for h in walk {
+                if !seen.contains(&h.id()) {
+                    combined.push(h); // current origin → P
+                }
+            }
+            combined
+        } else {
+            walk
+        };
 
         // Base state = account set after executing the pruned prefix (order[..=p_idx]).
         // Normally this is seeded from genesis; after finalized-tx pruning it must be
@@ -1927,6 +1942,48 @@ mod tests {
         assert!(n2.import_snapshot(&snap_large).unwrap());
         assert!(!n2.import_snapshot(&snap_small).unwrap(), "weaker proof refused");
         assert_eq!(n2.total_order(), large.total_order(), "n2 keeps the large chain");
+    }
+
+    #[test]
+    fn proof_chains_across_repeated_prunes() {
+        // After pruning twice, the retained proof must still anchor at genesis (the
+        // second prune chains its walk onto the first proof), so a fresh node can
+        // still bootstrap trustlessly from the twice-pruned node.
+        let miner = Pubkey::new_unique();
+        let mut src =
+            DagChain::open_with_daa(dir("chain-src"), 3, easy_target(), miner, 0, vec![], 10, 5)
+                .unwrap();
+        src.set_finality_depth(2);
+        let mut ts = 1_750_000_010i64;
+        for _ in 0..30 {
+            src.mine_at(&[], ts).unwrap();
+            ts += 10;
+            src.virtual_state().unwrap();
+        }
+        assert!(src.prune().unwrap() > 0, "first prune");
+        assert!(src.is_history_pruned());
+        for _ in 0..30 {
+            src.mine_at(&[], ts).unwrap();
+            ts += 10;
+            src.virtual_state().unwrap();
+        }
+        assert!(src.prune().unwrap() > 0, "second prune (chained proof)");
+
+        let snap = src.export_snapshot().unwrap();
+        let mut fresh =
+            DagChain::open_with_daa(dir("chain-dst"), 3, easy_target(), miner, 0, vec![], 10, 5)
+                .unwrap();
+        fresh.set_finality_depth(2);
+        assert!(
+            fresh.import_snapshot(&snap).unwrap(),
+            "fresh node bootstraps from a twice-pruned node (proof still genesis-anchored)"
+        );
+        assert_eq!(fresh.total_order(), src.total_order(), "bootstrapped order matches");
+        assert_eq!(
+            fresh.virtual_state().unwrap().state_root().unwrap(),
+            src.virtual_state().unwrap().state_root().unwrap(),
+            "bootstrapped state matches"
+        );
     }
 
     #[test]
