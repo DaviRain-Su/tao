@@ -49,8 +49,10 @@ impl BlockLog {
 
     /// Atomically replace the entire log with `records` (compaction). Writes a
     /// temp file and renames it over the log, so a crash leaves either the old
-    /// or the new log intact, never a partial one. The internal writer is
-    /// repointed at the compacted file for subsequent appends.
+    /// or the new log intact, never a partial one. Data and directory entries
+    /// are persisted for crash safety before the new handle is repointed.
+    /// The internal writer is repointed at the compacted file for subsequent
+    /// appends.
     pub fn replace_all(&self, records: &[Vec<u8>]) -> Result<()> {
         let mut writer = self.writer.lock().expect("block log mutex poisoned");
         let tmp = self.path.with_extension("log.compact");
@@ -68,7 +70,12 @@ impl BlockLog {
             temp.write_all(payload)?;
         }
         temp.flush()?;
+        temp.sync_all()?;
         std::fs::rename(&tmp, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            let parent_dir = File::open(parent)?;
+            parent_dir.sync_all()?;
+        }
         // Repoint the append handle at the compacted file.
         *writer = OpenOptions::new()
             .create(true)

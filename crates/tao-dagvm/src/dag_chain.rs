@@ -31,6 +31,8 @@ use tao_database::{AccountsDb, BlockLog};
 use tao_ghostdag::{blockhash, DagEngine, Hash as DagHash};
 use tao_runtime::{Bank, BankError};
 
+const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
 /// Fixed env blockhash for SVM execution (does not affect state for plain transfers).
 fn env_blockhash() -> Blockhash {
     Blockhash::new_from_array([7u8; 32])
@@ -90,10 +92,11 @@ fn legacy_block_id(header: &LegacyDagBlockHeader) -> Result<[u8; 32], String> {
 /// Bootstrap payload a pruned node ships to a fresh/behind peer: the pruning
 /// point (origin header + its account-set snapshot) plus the kept suffix blocks.
 ///
-/// The suffix is applied as *trusted* (no PoW/difficulty re-validation): a pruned
-/// node has discarded the history needed to re-derive the difficulty window for
-/// those finalized blocks. A trustless bootstrap needs PoW pruning proofs (Kaspa)
-/// — a documented follow-on; for now the snapshot is trusted like a checkpoint.
+/// The suffix is applied without re-checking PoW/difficulty for historical
+/// finalized blocks (a pruned node lacks that history), but the attached NiPoPoW
+/// proof is verified before adoption.
+/// A trustless bootstrap follows from the proof being verified against original
+/// genesis and compared by total work.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SyncSnapshot {
     origin_header: DagBlockHeader,
@@ -120,28 +123,19 @@ fn verify_proof(
     if proof.last().unwrap().id() != origin {
         return Err("proof does not end at the claimed origin".into());
     }
-    // The proof is genesis-first (topologically ordered). Each non-genesis header
-    // must carry valid PoW and point back — via an interlink entry or a parent —
-    // to a header already seen, so the whole set is connected to genesis. This
-    // tolerates the multi-level structure (consecutive proof headers need not be
-    // adjacent in the DAG). Work is the sum over the sampled headers.
-    let mut present: HashSet<[u8; 32]> = HashSet::new();
-    present.insert(proof[0].id());
+    // The proof is genesis-first. Each step follows exactly one interlink hop to
+    // the previous proof header, matching `build_proof_for`.
+    let mut prev = proof[0].id();
     let mut work = tao_consensus::work_for_target(&proof[0].target);
     for h in proof.iter().skip(1) {
         if !meets_target(&h.id(), &h.target) {
             return Err("invalid proof-of-work in proof".into());
         }
-        let connected = h
-            .interlink
-            .iter()
-            .chain(h.parents.iter())
-            .any(|p| present.contains(p));
-        if !connected {
+        if h.interlink.last() != Some(&prev) {
             return Err("proof not interlink-connected".into());
         }
         work = work.saturating_add(tao_consensus::work_for_target(&h.target));
-        present.insert(h.id());
+        prev = h.id();
     }
     Ok(work)
 }
@@ -387,17 +381,28 @@ impl DagChain {
         let mut proof = Vec::new();
         let mut cur = p;
         let mut guard = 0usize;
+        let mut seen = HashSet::new();
         loop {
-            let h = match self.headers.get(&cur) {
-                Some(h) => h.clone(),
-                None => break, // ancestor already pruned — proof can't reach genesis
+            let h = if let Some(h) = self.headers.get(&cur) {
+                Some(h.clone())
+            } else if self.history_pruned {
+                self.proof.iter().find(|h| h.id() == cur).cloned()
+            } else {
+                None
             };
-            let interlink = h.interlink.clone();
+            let h = match h {
+                Some(h) => h,
+                None => break, // ancestor missing from retained history
+            };
+            if !seen.insert(h.id()) {
+                break; // protect against accidental loops
+            }
+            let next = h.interlink.last().copied();
             proof.push(h);
-            match interlink.last() {
-                None => break, // genesis (empty interlink)
-                Some(&next) if next == cur => break,
-                Some(&next) => cur = next, // jump to the highest-level ancestor
+            match next {
+                None => break,
+                Some(n) if n == cur => break,
+                Some(n) => cur = n,
             }
             guard += 1;
             if guard > 1_000_000 {
@@ -865,9 +870,9 @@ impl DagChain {
         self.history_pruned
     }
 
-    /// Export a bootstrap snapshot (pruning point + base accounts + kept suffix)
-    /// for syncing a fresh/behind peer. `None` if this node hasn't pruned (such a
-    /// node serves full history via block backfill instead).
+/// Export a bootstrap snapshot (pruning point + base accounts + kept suffix)
+/// for syncing a fresh/behind peer. `None` if this node hasn't pruned (such a
+/// node serves full history via block backfill instead).
     pub fn export_snapshot(&self) -> Option<Vec<u8>> {
         if !self.history_pruned {
             return None;
@@ -891,9 +896,17 @@ impl DagChain {
     }
 
     /// Adopt a bootstrap snapshot from a pruned peer: re-anchor at its pruning
-    /// point and apply the trusted suffix. Returns `false` (no-op) if we already
-    /// have the snapshot's origin (caught up / ahead). Persists a compacted log.
+    /// point and apply its suffix after validating the attached NiPoPoW proof.
+    /// Returns `false` (no-op) if we already have the snapshot's origin (caught up / ahead).
+    /// Persists a compacted log.
     pub fn import_snapshot(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        if bytes.len() > MAX_SNAPSHOT_BYTES {
+            return Err(format!(
+                "snapshot too large: {} > {}",
+                bytes.len(),
+                MAX_SNAPSHOT_BYTES
+            ));
+        }
         let snap: SyncSnapshot = bincode::deserialize(bytes).map_err(|e| e.to_string())?;
         let origin = snap.origin_header.id();
         if self.blocks.contains(&origin) {
@@ -987,21 +1000,10 @@ impl DagChain {
         // Build the retained NiPoPoW proof for P *before* its ancestors are
         // dropped. The walk reaches the current origin; if we have pruned before,
         // its ancestors below the current origin are already gone, so the walk
-        // only spans current-origin→P. Chain it onto the retained proof
-        // (genesis→current-origin) so the combined proof stays genesis-anchored.
+        // only spans current-origin→P. If we already had a retained proof, walk
+        // can continue into it for a strict genesis-anchored chain.
         let walk = self.build_proof_for(p);
-        let new_proof = if self.history_pruned && !self.proof.is_empty() {
-            let seen: HashSet<[u8; 32]> = self.proof.iter().map(|h| h.id()).collect();
-            let mut combined = self.proof.clone(); // genesis → current origin
-            for h in walk {
-                if !seen.contains(&h.id()) {
-                    combined.push(h); // current origin → P
-                }
-            }
-            combined
-        } else {
-            walk
-        };
+        let new_proof = walk;
 
         // Base state = account set after executing the pruned prefix (order[..=p_idx]).
         // Normally this is seeded from genesis; after finalized-tx pruning it must be
@@ -1047,19 +1049,21 @@ impl DagChain {
         engine.add_block(p_dag, &[blockhash::ORIGIN]);
         for id in &order[p_idx + 1..] {
             let header = self.headers.get(id).expect("kept block has a header");
-            let mut parents: Vec<DagHash> = header
-                .parents
-                .iter()
-                .map(|pp| {
-                    if kept.contains(pp) {
-                        DagHash::from_bytes(*pp)
-                    } else {
-                        p_dag
-                    }
-                })
-                .collect();
-            parents.sort_by(|a, b| a.to_bytes().cmp(&b.to_bytes()));
-            parents.dedup();
+            let mut seen = HashSet::new();
+            let mut parents: Vec<DagHash> = Vec::with_capacity(header.parents.len());
+            for p in &header.parents {
+                let p_hash = if kept.contains(p) {
+                    DagHash::from_bytes(*p)
+                } else {
+                    p_dag
+                };
+                if seen.insert(p_hash.to_bytes()) {
+                    parents.push(p_hash);
+                }
+            }
+            if parents.is_empty() {
+                parents.push(p_dag);
+            }
             engine.add_block(DagHash::from_bytes(*id), &parents);
         }
 
@@ -1133,16 +1137,22 @@ impl DagChain {
             .block_txs
             .get(id)
             .map(|txs| {
-                txs.iter()
-                    .map(|t| {
-                        bincode::serialize(t).unwrap_or_else(|e| {
-                            tracing::warn!(error = %e, "serialize tx for block reply failed; dropping tx body");
-                            Vec::new()
-                        })
-                    })
-                    .collect()
+                let mut out = Vec::with_capacity(txs.len());
+                for tx in txs {
+                    match bincode::serialize(tx) {
+                        Ok(bytes) => out.push(bytes),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "serialize tx for block reply failed");
+                            return Vec::new();
+                        }
+                    }
+                }
+                out
             })
             .unwrap_or_default();
+        if transactions.is_empty() && self.block_txs.contains_key(id) {
+            return None;
+        }
         Some(DagBlock {
             header,
             transactions,
@@ -1174,6 +1184,28 @@ mod tests {
         let mut t = [0xffu8; 32];
         t[0] = 0x00;
         t
+    }
+
+    fn test_header(parents: Vec<[u8; 32]>, interlink: Vec<[u8; 32]>, nonce: u64) -> DagBlockHeader {
+        DagBlockHeader {
+            version: HEADER_VERSION,
+            parents,
+            timestamp: 1_750_000_000,
+            tx_merkle_root: Blockhash::default(),
+            state_root: Blockhash::default(),
+            target: easy_target(),
+            interlink,
+            nonce,
+            miner: Pubkey::new_unique(),
+        }
+    }
+
+    fn valid_proof_header(parents: Vec<[u8; 32]>, interlink: Vec<[u8; 32]>, nonce: u64) -> DagBlockHeader {
+        let mut header = test_header(parents, interlink, nonce);
+        while !meets_target(&header.id(), &header.target) {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        header
     }
 
     fn dir(tag: &str) -> PathBuf {
@@ -1905,7 +1937,11 @@ mod tests {
     fn most_work_proof_wins() {
         // A fresh node ends up on the higher-work chain regardless of the order in
         // which competing peers' snapshots arrive; a lower-work proof is refused.
-        let miner = Pubkey::new_unique();
+        // Fixed miner: Pubkey::new_unique() uses a process-global counter, so under
+        // parallel test runs it would vary → different block ids → different proof
+        // lengths → a flaky work comparison. A fixed miner keeps the chains (hence
+        // the proof works) deterministic in any test context.
+        let miner = Pubkey::new_from_array([7u8; 32]);
         let build = |tag: &str, n: usize| {
             let mut c =
                 DagChain::open_with_daa(dir(tag), 3, easy_target(), miner, 0, vec![], 10, 5)
@@ -1970,11 +2006,13 @@ mod tests {
         // After pruning twice, the retained proof must still anchor at genesis (the
         // second prune chains its walk onto the first proof), so a fresh node can
         // still bootstrap trustlessly from the twice-pruned node.
-        let miner = Pubkey::new_unique();
+        // Fixed miner (deterministic across parallel test runs — see most_work).
+        let miner = Pubkey::new_from_array([8u8; 32]);
         let mut src =
             DagChain::open_with_daa(dir("chain-src"), 3, easy_target(), miner, 0, vec![], 10, 5)
                 .unwrap();
         src.set_finality_depth(2);
+        let original_genesis = src.genesis_dag.to_bytes();
         let mut ts = 1_750_000_010i64;
         for _ in 0..30 {
             src.mine_at(&[], ts).unwrap();
@@ -1991,6 +2029,18 @@ mod tests {
         assert!(src.prune().unwrap() > 0, "second prune (chained proof)");
 
         let snap = src.export_snapshot().unwrap();
+        let snap_dbg: SyncSnapshot = bincode::deserialize(&snap).unwrap();
+        let prove = &snap_dbg.proof;
+        assert_eq!(
+            prove.first().map(|h| h.id()),
+            Some(original_genesis),
+            "proof must remain genesis anchored across repeated prune"
+        );
+        assert_eq!(
+            prove.last().map(|h| h.id()),
+            Some(src.total_order()[0]),
+            "proof must end at the current pruning origin"
+        );
         let mut fresh =
             DagChain::open_with_daa(dir("chain-dst"), 3, easy_target(), miner, 0, vec![], 10, 5)
                 .unwrap();
@@ -2061,6 +2111,45 @@ mod tests {
             !node2.is_history_pruned(),
             "rejected import left the node untouched"
         );
+    }
+
+    #[test]
+    fn import_rejects_oversize_snapshot() {
+        let mut chain = DagChain::open(
+            dir("snapshot-too-large"),
+            3,
+            easy_target(),
+            Pubkey::new_unique(),
+            0,
+            vec![],
+        )
+        .unwrap();
+
+        let err = chain
+            .import_snapshot(&vec![0x41u8; MAX_SNAPSHOT_BYTES.saturating_add(1)])
+            .unwrap_err();
+        assert!(
+            err.contains("snapshot too large"),
+            "oversize snapshot must be rejected before decode"
+        );
+    }
+
+    #[test]
+    fn verify_proof_rejects_non_linear_connection() {
+        let mut genesis = test_header(vec![], vec![], 1);
+        while !meets_target(&genesis.id(), &genesis.target) {
+            genesis.nonce = genesis.nonce.wrapping_add(1);
+        }
+
+        let mid = valid_proof_header(vec![genesis.id()], vec![genesis.id()], 2);
+
+        // Side-chain/header-skipping proof node: points to genesis instead of the
+        // previous proof entry, which old ancestry checks might still accept.
+        let tip = valid_proof_header(vec![genesis.id()], vec![genesis.id()], 3);
+
+        let proof = vec![genesis, mid, tip.clone()];
+        let err = verify_proof(&proof, tip.id(), proof[0].id()).unwrap_err();
+        assert_eq!(err, "proof not interlink-connected");
     }
 
     #[test]
