@@ -227,6 +227,8 @@ fn dag_run(
     let mut last_mine = Instant::now() - Duration::from_millis(block_interval_ms);
     let mut last_log = Instant::now();
     let mut last_request = Instant::now() - Duration::from_secs(1);
+    // Fire the first tip request immediately so a fresh node syncs on connect.
+    let mut last_tipreq = Instant::now() - Duration::from_secs(10);
 
     tracing::info!(%listen, miner = %miner_pubkey, "blockDAG node started");
 
@@ -243,6 +245,17 @@ fn dag_run(
                     if let Some(block) = chain.get_block(&id) {
                         let bytes = bincode::serialize(&block).expect("serialize block");
                         network.broadcast(&NetMsg::NewBlock(bytes));
+                    }
+                }
+                NetMsg::GetTips => {
+                    network.broadcast(&NetMsg::Tips(chain.tips().to_vec()));
+                }
+                NetMsg::Tips(tips) => {
+                    // Pull any tip we don't have → triggers transitive backfill.
+                    for id in tips {
+                        if !chain.has_block(&id) {
+                            network.broadcast(&NetMsg::GetBlock(id));
+                        }
                     }
                 }
                 NetMsg::NewTx(_) => {}
@@ -280,6 +293,13 @@ fn dag_run(
                 network.broadcast(&NetMsg::GetBlock(id));
             }
             last_request = Instant::now();
+        }
+
+        // Initial-sync heartbeat: ask peers for their tips so a node with no
+        // fresh gossip still discovers and backfills the chain.
+        if last_tipreq.elapsed() >= Duration::from_secs(2) {
+            network.broadcast(&NetMsg::GetTips);
+            last_tipreq = Instant::now();
         }
 
         // Mine on the current tips at the configured cadence.

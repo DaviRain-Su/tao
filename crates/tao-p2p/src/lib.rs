@@ -30,6 +30,12 @@ pub enum NetMsg {
     /// Request a block by id (32-byte hash). A peer that has it replies with
     /// `NewBlock`. Used to backfill an orphan's missing ancestors.
     GetBlock([u8; 32]),
+    /// Ask peers to announce their current DAG tips. Used for initial sync: a
+    /// node with no fresh gossip still discovers the chain.
+    GetTips,
+    /// Announce current DAG tip block ids (response to `GetTips`). The requester
+    /// `GetBlock`s any tip it doesn't have, which transitively backfills.
+    Tips(Vec<[u8; 32]>),
 }
 
 /// A handle to the gossip network: broadcast out, peers in via the inbound channel.

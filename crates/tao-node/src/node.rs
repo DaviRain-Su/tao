@@ -190,8 +190,8 @@ impl Miner {
                                 shared.submit(tx);
                             }
                         }
-                        // The linear chain doesn't serve DAG block backfill.
-                        NetMsg::GetBlock(_) => {}
+                        // The linear chain doesn't serve DAG block/tip sync.
+                        NetMsg::GetBlock(_) | NetMsg::GetTips | NetMsg::Tips(_) => {}
                     }
                 }
             }
