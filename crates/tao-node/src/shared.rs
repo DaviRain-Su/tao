@@ -21,6 +21,8 @@ pub struct Shared {
     pub accounts: Arc<AccountsDb>,
     /// Genesis block id (for `getGenesisHash`).
     pub genesis_hash: [u8; 32],
+    /// Faucet keypair secret (64 bytes) — enables `requestAirdrop` when set.
+    pub faucet: Option<[u8; 64]>,
     slot: AtomicU64,
     latest_blockhash: Mutex<[u8; 32]>,
     mempool: Mutex<Vec<Transaction>>,
@@ -36,10 +38,12 @@ impl Shared {
         genesis_hash: [u8; 32],
         slot: u64,
         latest_blockhash: [u8; 32],
+        faucet: Option<[u8; 64]>,
     ) -> Self {
         Self {
             accounts,
             genesis_hash,
+            faucet,
             slot: AtomicU64::new(slot),
             latest_blockhash: Mutex::new(latest_blockhash),
             mempool: Mutex::new(Vec::new()),

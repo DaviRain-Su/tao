@@ -54,10 +54,16 @@ axum = "0.7"
 base64 = "0.22"
 bs58 = "0.5"
 
-# ---- solana (rpc/decoding) ----
+# ---- solana (rpc/decoding/signing) ----
 solana-transaction = "3"
 solana-signature = "3"
 solana-rent = "3"
+solana-keypair = "3"
+solana-signer = "3"
+solana-system-interface = { version = "3", features = ["bincode"] }
+
+# ---- http client (cli) ----
+ureq = { version = "2", default-features = false, features = ["json"] }
 
 # ---- storage ----
 rocksdb = "0.24"

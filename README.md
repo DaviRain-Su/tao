@@ -108,7 +108,24 @@ tao-node run --mine --miner <PUBKEY> --data-dir n1 --listen 127.0.0.1:9001 --rpc
 tao-node run --data-dir n2 --listen 127.0.0.1:9002 --peers 127.0.0.1:9001 --rpc --rpc-port 8900
 ```
 
-Next: **M6** (CLI wallet + faucet + reproducible devnet).
+- **M6 — CLI wallet + faucet + devnet ✓** The `tao` CLI (`keygen`, `address`,
+  `balance`, `airdrop`, `transfer`) builds + signs transactions locally and
+  talks to the node's RPC. A node-side faucet (`requestAirdrop`) signs a real
+  transfer from a genesis-funded faucet account (replayable). `scripts/devnet.sh`
+  launches a one-command devnet (mining + RPC + faucet). Verified: keygen →
+  airdrop 2 TAO → balance → transfer 0.5 TAO → balances reflect amount + fee.
+
+```sh
+./scripts/devnet.sh .tao-devnet        # terminal 1
+tao keygen -o wallet.json              # terminal 2
+tao airdrop $(tao address -k wallet.json) 2000000000
+tao balance $(tao address -k wallet.json)
+```
+
+**All seven milestones (M0–M6) are complete.** Future work (per `docs/PLAN.md`):
+M7 — matmul-PoUW (AI-shaped GPU PoW with ZK verification, à la Pearl); M8 —
+blockDAG/GHOSTDAG consensus upgrade. Networking hardening (libp2p, IBD,
+multi-miner reorgs) and a real RandomX CPU phase also remain.
 
 ## License
 

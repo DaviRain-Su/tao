@@ -14,8 +14,11 @@ use axum::{extract::State, routing::post, Json, Router};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use solana_account::ReadableAccount;
+use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
+use solana_signer::Signer;
 use solana_transaction::Transaction;
+use tao_core::Hash;
 
 use crate::shared::Shared;
 
@@ -171,6 +174,37 @@ fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult {
             let sig_b58 = bs58::encode(sig.as_ref()).into_string();
             shared.submit(tx);
             shared.gossip_tx(raw); // relay to peers so the miner (any node) sees it
+            Ok(json!(sig_b58))
+        }
+
+        "requestAirdrop" => {
+            let target = parse_pubkey(&param_str(params, 0)?)?;
+            let lamports = params
+                .get(1)
+                .and_then(Value::as_u64)
+                .ok_or((INVALID_PARAMS, "expected lamports param at 1".into()))?;
+            let secret = shared
+                .faucet
+                .ok_or((INVALID_PARAMS, "faucet not enabled on this node".into()))?;
+            let faucet = Keypair::try_from(&secret[..])
+                .map_err(|e| (INTERNAL_ERROR, format!("bad faucet key: {e}")))?;
+            let blockhash = Hash::new_from_array(shared.latest_blockhash());
+            let ix =
+                solana_system_interface::instruction::transfer(&faucet.pubkey(), &target, lamports);
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&faucet.pubkey()),
+                &[&faucet],
+                blockhash,
+            );
+            let sig = tx
+                .signatures
+                .first()
+                .ok_or((INTERNAL_ERROR, "faucet tx has no signature".into()))?;
+            let sig_b58 = bs58::encode(sig.as_ref()).into_string();
+            let raw = bincode::serialize(&tx).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            shared.submit(tx);
+            shared.gossip_tx(raw);
             Ok(json!(sig_b58))
         }
 

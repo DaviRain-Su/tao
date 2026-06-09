@@ -37,6 +37,8 @@ pub struct MineOptions {
     pub blocks: u64,
     /// Whether this node produces blocks (a follower sets this false).
     pub mine: bool,
+    /// Faucet keypair secret (64 bytes) for `requestAirdrop`, if enabled.
+    pub faucet: Option<[u8; 64]>,
 }
 
 /// Block reward at `height` per the genesis emission schedule (halving).
@@ -119,6 +121,7 @@ pub fn prepare(opts: MineOptions) -> anyhow::Result<(Miner, Arc<Shared>)> {
         genesis_hash,
         chain.height(),
         chain.tip_id(),
+        opts.faucet,
     ));
     let miner = Miner {
         chain,

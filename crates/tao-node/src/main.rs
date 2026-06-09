@@ -62,6 +62,9 @@ enum Command {
         /// Comma-separated bootstrap peer addresses to dial.
         #[arg(long)]
         peers: Option<String>,
+        /// Faucet keypair file (enables requestAirdrop; must be funded in genesis).
+        #[arg(long)]
+        faucet_keypair: Option<PathBuf>,
     },
 }
 
@@ -70,9 +73,11 @@ fn main() -> anyhow::Result<()> {
     logging::init(&cli.log);
     match cli.command {
         Command::Init { data_dir } => init(data_dir),
-        Command::Run { config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers } => {
-            run(RunArgs { config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers })
-        }
+        Command::Run {
+            config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair,
+        } => run(RunArgs {
+            config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair,
+        }),
     }
 }
 
@@ -96,6 +101,17 @@ struct RunArgs {
     rpc_port: Option<u16>,
     listen: Option<String>,
     peers: Option<String>,
+    faucet_keypair: Option<PathBuf>,
+}
+
+/// Read a Solana-style keypair file (JSON array of 64 bytes).
+fn load_keypair_bytes(path: &PathBuf) -> anyhow::Result<[u8; 64]> {
+    let raw = std::fs::read_to_string(path)?;
+    let bytes: Vec<u8> = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("parse keypair {}: {e}", path.display()))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("keypair {} must be 64 bytes", path.display()))
 }
 
 fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -133,12 +149,18 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         ctrlc::set_handler(move || shutdown.store(true, Ordering::Relaxed)).ok();
     }
 
+    let faucet = match &args.faucet_keypair {
+        Some(path) => Some(load_keypair_bytes(path)?),
+        None => None,
+    };
+
     let (miner_loop, shared) = prepare(MineOptions {
         data_dir,
         genesis,
         miner: miner_pubkey,
         blocks: args.blocks,
         mine: args.mine,
+        faucet,
     })?;
 
     // P2P networking.
