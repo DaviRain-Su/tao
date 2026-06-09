@@ -144,6 +144,15 @@ enum Command {
         /// Number of weight tiles (layers) in the demo model.
         #[arg(long, default_value_t = 8)]
         tiles: usize,
+        /// Optional JSON file of inference requests to serve from a queue:
+        /// `[{"tile": <usize>, "input": [<n*n i64>]}, ...]`. Each request is mined
+        /// (bound to the model), verified, and its real output `A·B` produced.
+        /// Without it, inputs are generated (the demo). Overrides --blocks.
+        #[arg(long)]
+        requests: Option<PathBuf>,
+        /// Optional path to write the inference results as JSON.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -210,7 +219,9 @@ fn main() -> anyhow::Result<()> {
             k,
             finality_depth,
         ),
-        Command::UtilityMine { blocks, n, rank, tiles } => utility_mine(blocks, n, rank, tiles),
+        Command::UtilityMine { blocks, n, rank, tiles, requests, out } => {
+            utility_mine(blocks, n, rank, tiles, requests, out)
+        }
     }
 }
 
@@ -220,7 +231,29 @@ fn main() -> anyhow::Result<()> {
 /// nonce until the PoW target is met), verify it against the commitment, and emit
 /// the useful inference output `A·B`. A miner using random/forged weights is
 /// rejected by the Merkle check — the work is provably a real model computation.
-fn utility_mine(blocks: u64, n: usize, rank: usize, tiles: usize) -> anyhow::Result<()> {
+/// One queued inference request: apply model layer `tile` to `input` (n×n).
+#[derive(serde::Deserialize)]
+struct InferenceRequest {
+    tile: usize,
+    input: Vec<i64>,
+}
+
+/// A served result: the request's real output `A·B` plus its PoW nonce.
+#[derive(serde::Serialize)]
+struct InferenceResult {
+    tile: usize,
+    nonce: u64,
+    output: Vec<i64>,
+}
+
+fn utility_mine(
+    blocks: u64,
+    n: usize,
+    rank: usize,
+    tiles: usize,
+    requests: Option<PathBuf>,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
     use tao_pouw::utility_gate::{ModelRegistry, UtilityGate, WorkItem};
 
     if n == 0 || rank == 0 || rank > n || tiles == 0 {
@@ -239,19 +272,46 @@ fn utility_mine(blocks: u64, n: usize, rank: usize, tiles: usize) -> anyhow::Res
     let mut target = [0xffu8; 32];
     target[0] = 0x00;
 
+    // Build the work queue: real requests from a file (the demand side), or
+    // generated inputs for the demo.
+    let queue: Vec<(usize, Vec<i64>)> = if let Some(path) = &requests {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read requests {}: {e}", path.display()))?;
+        let reqs: Vec<InferenceRequest> = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse requests: {e}"))?;
+        for (i, r) in reqs.iter().enumerate() {
+            if r.tile >= tiles {
+                return Err(anyhow::anyhow!("request {i}: tile {} out of range (tiles={tiles})", r.tile));
+            }
+            if r.input.len() != n * n {
+                return Err(anyhow::anyhow!("request {i}: input len {} != n*n {}", r.input.len(), n * n));
+            }
+        }
+        reqs.into_iter().map(|r| (r.tile, r.input)).collect()
+    } else {
+        (0..blocks)
+            .map(|h| {
+                let tile = (h as usize) % tiles;
+                let input = (0..n * n).map(|i| ((h as usize + i) % 5) as i64 - 2).collect();
+                (tile, input)
+            })
+            .collect()
+    };
+
     println!("utility-gated matmul-PoUW:");
     println!("  model:     tao-demo-llm  id={}", hex_bytes(&model_id));
     println!("  dims:      {n}x{n}  tiles={tiles}  rank={rank}");
+    println!(
+        "  queue:     {} {}",
+        queue.len(),
+        if requests.is_some() { "request(s) from file" } else { "generated work item(s)" }
+    );
 
     let mut total_nonces: u128 = 0;
     let mut output_checksum: i64 = 0;
-    for h in 0..blocks {
-        // Each block applies one model layer (tile) to a fresh requested input —
-        // a stand-in for a real paid inference request.
-        let tile_index = (h as usize) % tiles;
-        let input: Vec<i64> = (0..n * n).map(|i| ((h as usize + i) % 5) as i64 - 2).collect();
+    let mut results: Vec<InferenceResult> = Vec::with_capacity(queue.len());
+    for (idx, (tile_index, input)) in queue.into_iter().enumerate() {
         let work = WorkItem { model_id, tile_index, input };
-
         let proof = registry
             .tile_proof(&model_id, tile_index)
             .ok_or_else(|| anyhow::anyhow!("missing tile proof"))?;
@@ -259,17 +319,25 @@ fn utility_mine(blocks: u64, n: usize, rank: usize, tiles: usize) -> anyhow::Res
 
         // A validating peer re-checks the binding (model + input + Merkle + PoW).
         gate.verify(&registry, &work, &target, &sol)
-            .map_err(|e| anyhow::anyhow!("utility gate rejected block {h}: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("utility gate rejected request {idx}: {e:?}"))?;
 
         let output = gate.useful_output(&sol, n);
         total_nonces += sol.nonce as u128 + 1;
         output_checksum = output_checksum.wrapping_add(output.iter().sum::<i64>());
-        tracing::info!(block = h, tile = tile_index, nonce = sol.nonce, "mined + verified bound solution");
+        results.push(InferenceResult { tile: tile_index, nonce: sol.nonce, output });
+        tracing::info!(request = idx, tile = tile_index, nonce = sol.nonce, "served + verified inference");
     }
 
-    println!("  blocks:    {blocks}  (all verified against the model commitment)");
-    println!("  avg grind: {} nonces/block", if blocks > 0 { total_nonces / blocks as u128 } else { 0 });
+    let served = results.len();
+    println!("  served:    {served}  (all verified against the model commitment)");
+    println!("  avg grind: {} nonces/request", if served > 0 { total_nonces / served as u128 } else { 0 });
     println!("  output Σ:  {output_checksum}  (real A·B inference results)");
+
+    if let Some(path) = &out {
+        let json = serde_json::to_string_pretty(&results)?;
+        std::fs::write(path, json).map_err(|e| anyhow::anyhow!("write out {}: {e}", path.display()))?;
+        println!("  wrote {} results → {}", served, path.display());
+    }
     Ok(())
 }
 
