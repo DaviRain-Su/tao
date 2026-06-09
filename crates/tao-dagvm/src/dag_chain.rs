@@ -171,8 +171,30 @@ impl DagChain {
     /// genesis / current target. Reuses [`tao_consensus::next_target`].
     pub fn next_target(&self) -> Target {
         // The next block's selected parent is the current heaviest tip.
-        let mut cur = self.engine.tip();
+        self.selected_chain_target(self.engine.tip())
+    }
+
+    /// The DAA-expected target for a *new* block referencing `parents`: derived
+    /// from the LWMA over the selected parent's chain. The selected parent is the
+    /// parent with the greatest blue work (ties by larger hash) — exactly
+    /// GHOSTDAG's `find_selected_parent`, so every node computes the same target
+    /// and a miner cannot lowball difficulty by referencing a weaker parent.
+    pub fn expected_target(&self, parents: &[[u8; 32]]) -> Target {
+        let sp = parents
+            .iter()
+            .copied()
+            .map(DagHash::from_bytes)
+            .map(|p| (self.engine.data(p).blue_work, p))
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(_, p)| p)
+            .unwrap_or(self.genesis_dag);
+        self.selected_chain_target(sp)
+    }
+
+    /// LWMA target over the selected-parent chain ending at `selected_parent`.
+    fn selected_chain_target(&self, selected_parent: DagHash) -> Target {
         let take = (self.lwma_window as usize).saturating_add(1);
+        let mut cur = selected_parent;
         let mut chain: Vec<DagHash> = Vec::new();
         loop {
             chain.push(cur);
@@ -257,6 +279,12 @@ impl DagChain {
         }
         if !block.header.parents.iter().all(|p| self.blocks.contains(p)) {
             return Err("unknown parent (orphan)".into());
+        }
+        // Consensus-enforced difficulty: the block must declare exactly the
+        // DAA-expected target for its parents (else PoW could be lowballed).
+        let expected = self.expected_target(&block.header.parents);
+        if block.header.target != expected {
+            return Err("unexpected difficulty target".into());
         }
         self.log.append(&bincode::serialize(&block).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         self.apply(&block)
@@ -517,6 +545,24 @@ mod tests {
             work_for_target(&nt) > work_for_target(&easy_target()),
             "fast blocks raise difficulty (more work than genesis)"
         );
+    }
+
+    #[test]
+    fn rejects_lowballed_difficulty() {
+        // A block that declares an easier-than-expected target (to cheapen its
+        // PoW) must be rejected even though its (easy) PoW "passes".
+        let miner = Pubkey::new_unique();
+        let mut chain = DagChain::open(dir("lowball"), 3, easy_target(), miner, 0, vec![]).unwrap();
+        // Build a valid external block off genesis, then tamper its target.
+        let side = DagChain::open(dir("lowball-side"), 3, easy_target(), miner, 0, vec![]).unwrap();
+        let mut block = side.build_block(&[]);
+        block.header.target = [0xff; 32]; // trivially-easy target
+        while !meets_target(&block.header.id(), &block.header.target) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        let err = chain.accept(block).unwrap_err();
+        assert!(err.contains("unexpected difficulty"), "expected difficulty rejection, got: {err}");
+        assert_eq!(chain.block_count(), 1, "the lowballed block was not accepted");
     }
 
     #[test]
