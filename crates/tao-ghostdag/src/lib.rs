@@ -17,6 +17,7 @@
 //! - Storage uses interior-mutability in-memory stores (the reference impls);
 //!   a persistent store implements the same traits later.
 
+mod engine;
 mod protocol;
 #[cfg(test)]
 mod tests;
@@ -24,6 +25,7 @@ mod tests;
 use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
 
+pub use engine::DagEngine;
 pub use protocol::{GhostdagData, GhostdagManager, SortableBlock};
 pub use tao_reachability::{blockhash, BlockHashes, Hash, ReachabilityStoreReader, StoreError};
 
