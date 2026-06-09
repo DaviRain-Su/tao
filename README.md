@@ -131,6 +131,9 @@ tao balance $(tao address -k wallet.json)
   RandomX→GPU evolution mechanism. *Prototype = CPU integer matmul, verified by
   recomputation.* Production (future) adds GPU CUDA kernels, Plonky2 STARK
   proofs (cheap verify), and a utility gate binding the work to a real model.
+
+  **Now runnable live** with the node (no source changes):
+  `tao-node run --mine --matmul ...` (or `--matmul-n 16 --pow-switch-height 1000` etc.). The mining loop, batching, and mempool were also tuned for the slower matrix case.
   - **Utility gate** (`tao-pouw::utility_gate`, see [`docs/utility-gate.md`](docs/utility-gate.md)):
     the design that closes Pearl's open flaw (its network does ≈zero real AI).
     A model registry commits to weights via a Merkle root; a work item binds

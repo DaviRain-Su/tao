@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use solana_transaction::Transaction;
 use tao_database::AccountsDb;
+use tao_mempool::Mempool;
 use tao_p2p::{NetMsg, Network};
 
 /// Confirmed transaction status: `None` = success, `Some(err)` = failed.
@@ -25,7 +26,7 @@ pub struct Shared {
     pub faucet: Option<[u8; 64]>,
     slot: AtomicU64,
     latest_blockhash: Mutex<[u8; 32]>,
-    mempool: Mutex<Vec<Transaction>>,
+    mempool: Mutex<Mempool>,
     /// Confirmed signatures → result. Presence means "confirmed".
     sig_status: Mutex<HashMap<[u8; 64], SigResult>>,
     /// Gossip network handle (attached after construction).
@@ -46,7 +47,7 @@ impl Shared {
             faucet,
             slot: AtomicU64::new(slot),
             latest_blockhash: Mutex::new(latest_blockhash),
-            mempool: Mutex::new(Vec::new()),
+            mempool: Mutex::new(Mempool::new(4096)), // reasonable cap for prototype
             sig_status: Mutex::new(HashMap::new()),
             network: OnceLock::new(),
         }
@@ -78,14 +79,15 @@ impl Shared {
         *self.latest_blockhash.lock().unwrap() = blockhash;
     }
 
-    /// Queue a transaction for inclusion.
+    /// Queue a transaction for inclusion (deduplicated inside the mempool).
     pub fn submit(&self, tx: Transaction) {
-        self.mempool.lock().unwrap().push(tx);
+        let _ = self.mempool.lock().unwrap().submit(tx);
     }
 
-    /// Drain all pending transactions (called by the miner per block).
+    /// Drain up to a reasonable number of pending transactions for the next block template.
+    /// In slow-PoW (matmul) scenarios this prevents trying to stuff too many txs into one block.
     pub fn drain_mempool(&self) -> Vec<Transaction> {
-        std::mem::take(&mut self.mempool.lock().unwrap())
+        self.mempool.lock().unwrap().drain(4096)
     }
 
     /// Record a confirmed signature result.

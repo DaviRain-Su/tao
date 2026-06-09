@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use solana_pubkey::Pubkey;
+
+use tao_consensus::Blake3Pow;
 use tao_core::{config::NodeConfig, genesis::GenesisConfig, logging};
 
 use node::{prepare, MineOptions};
@@ -44,6 +46,20 @@ enum Command {
         /// Enable the CPU miner.
         #[arg(long)]
         mine: bool,
+        /// Use the matmul-PoUW matrix algorithm for PoW (AI-shaped, from tao-pouw).
+        /// Combine with --matmul-n / --matmul-rank for size, or --pow-switch-height for automatic Blake3->matmul switch.
+        #[arg(long)]
+        matmul: bool,
+        /// Matrix dimension n for matmul-PoUW (n x n matrices). Default 8 when --matmul is used.
+        #[arg(long)]
+        matmul_n: Option<usize>,
+        /// Noise rank for matmul-PoUW. Default 2 when --matmul is used.
+        #[arg(long)]
+        matmul_rank: Option<usize>,
+        /// Height at which to switch from Blake3 to matmul-PoUW (enables HeightSwitchPow).
+        /// Before this height: Blake3. At/after: the matmul config from --matmul-* flags (or defaults).
+        #[arg(long)]
+        pow_switch_height: Option<u64>,
         /// Base58 reward address for mined blocks (overrides config).
         #[arg(long)]
         miner: Option<String>,
@@ -74,9 +90,11 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Init { data_dir } => init(data_dir),
         Command::Run {
-            config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair,
+            config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair, matmul,
+            matmul_n, matmul_rank, pow_switch_height,
         } => run(RunArgs {
-            config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair,
+            config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair, matmul,
+            matmul_n, matmul_rank, pow_switch_height,
         }),
     }
 }
@@ -102,6 +120,10 @@ struct RunArgs {
     listen: Option<String>,
     peers: Option<String>,
     faucet_keypair: Option<PathBuf>,
+    matmul: bool,
+    matmul_n: Option<usize>,
+    matmul_rank: Option<usize>,
+    pow_switch_height: Option<u64>,
 }
 
 /// Read a Solana-style keypair file (JSON array of 64 bytes).
@@ -154,6 +176,27 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         None => None,
     };
 
+    // Determine PoW algorithm from CLI flags.
+    // Supports plain matmul, or automatic switch (HeightSwitchPow) for the M7 evolution story.
+    let default_n = 8usize;
+    let default_rank = 2usize;
+    let use_matmul = args.matmul || args.matmul_n.is_some() || args.matmul_rank.is_some();
+    let n = args.matmul_n.unwrap_or(default_n);
+    let rank = args.matmul_rank.unwrap_or(default_rank);
+
+    let pow: Arc<dyn tao_consensus::PowAlgorithm> = if let Some(switch_h) = args.pow_switch_height {
+        // Blake3 (fair launch / CPU) until switch_h, then matmul-PoUW.
+        let before = Arc::new(Blake3Pow);
+        let after = Arc::new(tao_pouw::MatmulPow::new(n, rank));
+        Arc::new(tao_consensus::HeightSwitchPow::new(before, after, switch_h))
+    } else if use_matmul {
+        // Pure matmul-PoUW (matrix multiplication as the PoW work).
+        // Use small n/rank for CPU demos; larger values (e.g. 64,4) for GPU-like feel.
+        Arc::new(tao_pouw::MatmulPow::new(n, rank))
+    } else {
+        Arc::new(Blake3Pow)
+    };
+
     let (miner_loop, shared) = prepare(MineOptions {
         data_dir,
         genesis,
@@ -161,6 +204,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         blocks: args.blocks,
         mine: args.mine,
         faucet,
+        pow,
     })?;
 
     // P2P networking.

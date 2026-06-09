@@ -9,3 +9,4 @@ description = "Transaction pool and block-template construction"
 
 [dependencies]
 tao-core.workspace = true
+solana-transaction.workspace = true

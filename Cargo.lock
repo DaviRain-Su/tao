@@ -3967,6 +3967,7 @@ dependencies = [
 name = "tao-mempool"
 version = "0.1.0"
 dependencies = [
+ "solana-transaction",
  "tao-core",
 ]
 
@@ -3995,7 +3996,9 @@ dependencies = [
  "tao-consensus",
  "tao-core",
  "tao-database",
+ "tao-mempool",
  "tao-p2p",
+ "tao-pouw",
  "tao-runtime",
  "tokio",
  "tracing",
@@ -4018,6 +4021,14 @@ dependencies = [
  "blake3",
  "tao-consensus",
  "tao-core",
+]
+
+[[package]]
+name = "tao-reachability"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

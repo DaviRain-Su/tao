@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 tao-core.workspace = true
 tao-consensus.workspace = true
+tao-pouw.workspace = true
+tao-mempool.workspace = true
 tao-database.workspace = true
 tao-runtime.workspace = true
 tao-p2p.workspace = true

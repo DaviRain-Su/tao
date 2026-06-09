@@ -1,10 +1,13 @@
-//! Node assembly and the M2–M4 mining loop.
+//! Node assembly and the mining loop.
 //!
 //! Builds genesis + consensus [`ChainState`] + durable [`BlockLog`] + execution
 //! [`Bank`] (embedded SVM over `AccountsDb`). The miner drains the mempool into
 //! each block, executes it through the Bank, stamps `state_root` into the
-//! header, mines PoW, and records signature statuses for the RPC. On startup the
-//! block log is replayed and re-executed, verifying every block's `state_root`.
+//! header, mines PoW (pluggable: Blake3, MatmulPow / HeightSwitchPow for the
+//! AI-shaped matrix PoW, etc.), and records signature statuses for the RPC.
+//! On startup the block log is replayed and re-executed, verifying every block's
+//! `state_root`. The PoW algorithm is supplied via [`MineOptions::pow`] so the
+//! live miner and chain verification use the same instance (enabling M7 matmul-PoUW).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,8 +19,8 @@ use anyhow::{anyhow, Context};
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use tao_consensus::{
-    block::Block, genesis::genesis_header, grind, mine::GrindResult, Blake3Pow, BlockStatus,
-    ChainState, DifficultyParams,
+    block::Block, genesis::genesis_header, grind, mine::GrindResult, BlockStatus, ChainState,
+    DifficultyParams, PowAlgorithm,
 };
 use tao_core::{genesis::GenesisConfig, Hash};
 use tao_database::{AccountsDb, BlockLog};
@@ -26,7 +29,10 @@ use tao_runtime::{load_allocations, Bank};
 
 use crate::shared::Shared;
 
-const GRIND_BATCH: u64 = 200_000;
+// Default batch size for cheap PoW (Blake3 etc.). For expensive matmul-PoUW we use a much
+// smaller batch so we can refresh timestamp and difficulty more frequently.
+const GRIND_BATCH_FAST: u64 = 200_000;
+const GRIND_BATCH_SLOW: u64 = 200; // ~O(n^3) per attempt — keep responsive
 
 /// Settings for a mining run.
 pub struct MineOptions {
@@ -39,6 +45,10 @@ pub struct MineOptions {
     pub mine: bool,
     /// Faucet keypair secret (64 bytes) for `requestAirdrop`, if enabled.
     pub faucet: Option<[u8; 64]>,
+    /// The PoW algorithm instance used for both chain verification (on replay/startup)
+    /// and for mining new blocks. Pass e.g. `Arc::new(Blake3Pow)` (default) or
+    /// `Arc::new(tao_pouw::MatmulPow::new(8, 2))` / `HeightSwitchPow` for the matrix AI PoW.
+    pub pow: Arc<dyn PowAlgorithm>,
 }
 
 /// Block reward at `height` per the genesis emission schedule (halving).
@@ -75,6 +85,8 @@ pub struct Miner {
     miner: Pubkey,
     blocks: u64,
     mine: bool,
+    /// Active PoW algorithm (Blake3, MatmulPow, HeightSwitchPow, etc.).
+    pow: Arc<dyn PowAlgorithm>,
 }
 
 /// Build chain + account state (replaying & re-executing the log) and the
@@ -84,7 +96,7 @@ pub fn prepare(opts: MineOptions) -> anyhow::Result<(Miner, Arc<Shared>)> {
     let genesis_hash = g.id();
     let params =
         DifficultyParams::new(opts.genesis.pow.target_block_time_secs, opts.genesis.pow.lwma_window);
-    let mut chain = ChainState::new(g, params, Arc::new(Blake3Pow));
+    let mut chain = ChainState::new(g, params, opts.pow.clone());
 
     // Account store is a derived cache: wipe and rebuild from the log.
     let accounts_dir = opts.data_dir.join("accounts");
@@ -131,6 +143,7 @@ pub fn prepare(opts: MineOptions) -> anyhow::Result<(Miner, Arc<Shared>)> {
         miner: opts.miner,
         blocks: opts.blocks,
         mine: opts.mine,
+        pow: opts.pow,
     };
     Ok((miner, shared))
 }
@@ -151,7 +164,8 @@ impl Miner {
             network = %self.genesis.network,
             mode,
             start_height = self.chain.height(),
-            "node starting (blake3 PoW + SVM execution)"
+            pow = self.pow.name(),
+            "node starting (PoW mining + SVM execution)"
         );
 
         let mut produced = 0u64;
@@ -199,7 +213,7 @@ impl Miner {
         produced: &mut u64,
         last_block_time: &mut i64,
     ) -> anyhow::Result<()> {
-        let pow = Blake3Pow;
+        let pow = self.pow.as_ref();
         let height = self.chain.height() + 1;
         let reward = emission(&self.genesis, height);
         let parent_hash = Hash::new_from_array(self.chain.tip_id());
@@ -213,15 +227,16 @@ impl Miner {
         header.state_root = Hash::new_from_array(exec.state_root);
 
         let grind_start = Instant::now();
-        let mut total_hashes = 0u64;
+        let batch = if pow.name().contains("matmul") { GRIND_BATCH_SLOW } else { GRIND_BATCH_FAST };
+        let mut total_attempts = 0u64;
         loop {
-            match grind(&mut header, &pow, GRIND_BATCH) {
-                GrindResult::Found { hashes } => {
-                    total_hashes += hashes;
+            match grind(&mut header, pow, batch) {
+                GrindResult::Found { hashes: attempts } => {
+                    total_attempts += attempts;
                     break;
                 }
-                GrindResult::Exhausted { hashes } => {
-                    total_hashes += hashes;
+                GrindResult::Exhausted { hashes: attempts } => {
+                    total_attempts += attempts;
                     header.timestamp = unix_now();
                 }
             }
@@ -250,14 +265,14 @@ impl Miner {
         *last_block_time = now;
         *produced += 1;
 
-        let hps = total_hashes as f64 / grind_start.elapsed().as_secs_f64().max(1e-9);
+        let rate = total_attempts as f64 / grind_start.elapsed().as_secs_f64().max(1e-9);
         tracing::info!(
             height = header.height,
             txs = txs.len(),
             solvetime_s = solvetime,
             zero_bits = leading_zero_bits(&header.target),
             miner_balance = self.bank.balance(&self.miner),
-            hashrate_hs = format_args!("{hps:.0}"),
+            work_rate = format_args!("{rate:.0}"),
             peers = network.map(|n| n.peer_count()).unwrap_or(0),
             status = ?status_label(&status),
             "mined block"
