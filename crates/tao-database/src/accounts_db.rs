@@ -71,21 +71,50 @@ impl AccountsDb {
         self.db.write(batch).map_err(storage_err)
     }
 
-    /// Deterministic hash over the entire account set.
-    ///
-    /// RocksDB iterates in lexicographic key order, so the digest is independent
-    /// of insertion order — two nodes with the same accounts get the same root.
-    /// (A Sparse Merkle Tree replaces this full scan later; see the plan.)
-    pub fn state_root(&self) -> Result<[u8; 32]> {
-        let mut hasher = blake3::Hasher::new();
+    /// Value hash of a stored account: BLAKE3 of its serialized bytes. The SMT
+    /// leaf commits `(key, value_hash)`. A light client recomputes this from the
+    /// account it received.
+    pub fn account_value_hash(account_bytes: &[u8]) -> [u8; 32] {
+        *blake3::hash(account_bytes).as_bytes()
+    }
+
+    /// Collect `(key, value_hash)` for every account, in arbitrary order.
+    fn smt_entries(&self) -> Result<Vec<([u8; 32], [u8; 32])>> {
+        let mut entries = Vec::new();
         for item in self.db.iterator(IteratorMode::Start) {
             let (k, v) = item.map_err(storage_err)?;
-            hasher.update(&(k.len() as u32).to_be_bytes());
-            hasher.update(&k);
-            hasher.update(&(v.len() as u32).to_be_bytes());
-            hasher.update(&v);
+            let key: [u8; 32] = k
+                .as_ref()
+                .try_into()
+                .map_err(|_| storage_err("account key is not 32 bytes"))?;
+            entries.push((key, Self::account_value_hash(&v)));
         }
-        Ok(*hasher.finalize().as_bytes())
+        Ok(entries)
+    }
+
+    /// The **Sparse Merkle Tree root** over the account set: a 256-bit commitment
+    /// that a light client can verify individual accounts against (see
+    /// [`state_proof`](Self::state_proof)). Deterministic — two nodes with the
+    /// same accounts agree.
+    ///
+    /// (Built from scratch per call; incremental O(log n) maintenance in storage
+    /// is a follow-on.)
+    pub fn state_root(&self) -> Result<[u8; 32]> {
+        Ok(crate::smt::SparseMerkleTree::from_entries(self.smt_entries()?).root())
+    }
+
+    /// A light-client proof for `key`: the account (or `None` if absent) plus its
+    /// SMT inclusion/exclusion proof against [`state_root`](Self::state_root). The
+    /// client verifies with [`crate::smt::verify`] using
+    /// `leaf_hash(key, account_value_hash(account))` (present) or `EMPTY_LEAF`
+    /// (absent).
+    pub fn state_proof(
+        &self,
+        key: &Pubkey,
+    ) -> Result<(Option<AccountSharedData>, crate::smt::MerkleProof)> {
+        let tree = crate::smt::SparseMerkleTree::from_entries(self.smt_entries()?);
+        let proof = tree.proof(&key.to_bytes());
+        Ok((self.get(key)?, proof))
     }
 
     /// Dump every account as (pubkey, account) pairs — for snapshotting state
@@ -145,6 +174,36 @@ mod tests {
 
         db.delete(&key).unwrap();
         assert!(db.get(&key).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn light_client_proof_against_state_root() {
+        let dir = tmp_dir("proof");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = AccountsDb::open(&dir).unwrap();
+        let owner = Pubkey::new_unique();
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        db.set(&a, &account(111, owner)).unwrap();
+        db.set(&b, &account(222, owner)).unwrap();
+
+        let root = db.state_root().unwrap();
+
+        // Inclusion: a light client verifies account `a` against the root.
+        let (acct, proof) = db.state_proof(&a).unwrap();
+        let acct = acct.expect("present");
+        let bytes = bincode::serialize(&acct).unwrap();
+        let leaf = crate::smt::leaf_hash(&a.to_bytes(), &AccountsDb::account_value_hash(&bytes));
+        assert!(crate::smt::verify(&root, &a.to_bytes(), &leaf, &proof));
+        assert_eq!(acct.lamports(), 111);
+
+        // Exclusion: an absent key verifies against EMPTY_LEAF, not any value.
+        let absent = Pubkey::new_unique();
+        let (none, xproof) = db.state_proof(&absent).unwrap();
+        assert!(none.is_none());
+        assert!(crate::smt::verify(&root, &absent.to_bytes(), &crate::smt::EMPTY_LEAF, &xproof));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

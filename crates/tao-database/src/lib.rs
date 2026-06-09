@@ -10,6 +10,8 @@
 
 mod accounts_db;
 mod block_log;
+pub mod smt;
 
 pub use accounts_db::AccountsDb;
 pub use block_log::BlockLog;
+pub use smt::{MerkleProof, SparseMerkleTree};
