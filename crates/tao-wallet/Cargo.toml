@@ -1,0 +1,11 @@
+[package]
+name = "tao-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Ed25519/BIP32 key management and transaction construction"
+
+[dependencies]
+tao-core.workspace = true

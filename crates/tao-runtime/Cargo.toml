@@ -1,0 +1,11 @@
+[package]
+name = "tao-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bank layer: AccountsDB plus solana-svm transaction execution"
+
+[dependencies]
+tao-core.workspace = true

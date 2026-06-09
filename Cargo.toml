@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "ISC"
+authors = ["Tao contributors"]
+repository = "https://github.com/Davirain/tao"
+rust-version = "1.81"
+
+[workspace.dependencies]
+# ---- internal crates ----
+tao-core = { path = "crates/tao-core" }
+tao-consensus = { path = "crates/tao-consensus" }
+tao-runtime = { path = "crates/tao-runtime" }
+tao-database = { path = "crates/tao-database" }
+tao-p2p = { path = "crates/tao-p2p" }
+tao-mempool = { path = "crates/tao-mempool" }
+tao-rpc = { path = "crates/tao-rpc" }
+tao-wallet = { path = "crates/tao-wallet" }
+
+# ---- error / utility ----
+thiserror = "2"
+anyhow = "1"
+hex = "0.4"
+
+# ---- serialization ----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bincode = "1.3"
+
+# ---- crypto / math ----
+blake3 = "1"
+primitive-types = "0.13"
+
+# ---- logging ----
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ---- cli ----
+clap = { version = "4", features = ["derive"] }
+
+# ---- async ----
+tokio = { version = "1", features = ["full"] }
+
+# ---- process ----
+ctrlc = { version = "3", features = ["termination"] }
+
+# ---- solana ecosystem (compat layer) ----
+solana-pubkey = { version = "=4.2.0", features = ["serde"] }
+solana-hash = { version = "=4.0.1", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

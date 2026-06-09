@@ -1,0 +1,12 @@
+[package]
+name = "tao-database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Durable persistence for chain and account state"
+
+[dependencies]
+tao-core.workspace = true
+tracing.workspace = true
