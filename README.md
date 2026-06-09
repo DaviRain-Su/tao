@@ -76,8 +76,23 @@ cargo run -p tao-node -- run --mine \
   initialize a mint, initialize a token account, `MintTo`, and the token
   balance reads back correctly. Anchor programs run via the same path. 32 tests.
 
-Next: **M4** (Solana-compatible JSON-RPC so Phantom / web3.js can submit
-transactions) and **M5** (P2P networking + mempool).
+- **M4 — Solana-compatible JSON-RPC ✓** An axum JSON-RPC server with the core
+  method set (`getHealth`, `getVersion`, `getSlot`, `getLatestBlockhash`,
+  `getBalance`, `getAccountInfo`, `getMinimumBalanceForRentExemption`,
+  `getFeeForMessage`, `sendTransaction`, `getSignatureStatuses`, ...) returning
+  Solana's `{context, value}` shapes. A mempool feeds the miner, which records
+  signature statuses. **Verified end-to-end with the real `@solana/web3.js`
+  SDK**: it connected, submitted a `SystemProgram.transfer`, the tx was mined +
+  executed via the SVM + confirmed, and balances matched (amount + 5000 fee).
+  Run with `--rpc`:
+
+```sh
+cargo run -p tao-node -- run --mine --rpc \
+  --miner So11111111111111111111111111111111111111112 --data-dir .tao
+```
+
+Next: **M5** (P2P networking — multi-node block/tx propagation + IBD) and
+**M6** (CLI wallet + faucet + devnet).
 
 ## License
 

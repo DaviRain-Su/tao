@@ -387,22 +387,17 @@ impl Bank {
         block_reward: u64,
     ) -> Result<BlockExecution, BankError> {
         let mut fees = 0u64;
-        let mut executed = 0usize;
-        let mut failed = 0usize;
+        let mut outcomes = Vec::with_capacity(transactions.len());
 
         for tx in transactions {
-            match self.execute_transaction(tx, blockhash) {
+            match self.execute_transaction(tx, blockhash.clone()) {
                 Ok(outcome) => {
                     fees = fees.saturating_add(outcome.fee);
-                    if outcome.succeeded {
-                        executed += 1;
-                    } else {
-                        failed += 1;
-                    }
+                    outcomes.push(outcome);
                 }
                 Err(e) => {
-                    failed += 1;
                     tracing::warn!(error = %e, "transaction rejected before processing");
+                    outcomes.push(TxOutcome { succeeded: false, fee: 0, error: Some(e.to_string()) });
                 }
             }
         }
@@ -411,7 +406,14 @@ impl Bank {
         self.credit(miner, block_reward.saturating_add(fees))?;
 
         let state_root = self.state_root()?;
-        Ok(BlockExecution { state_root, fees, reward: block_reward, executed, failed })
+        Ok(BlockExecution { state_root, fees, reward: block_reward, outcomes })
+    }
+
+    /// Credit lamports to an account out-of-band (e.g. a devnet faucet).
+    /// Recorded in `state_root` only — callers wanting replayability must record
+    /// the credit in the block.
+    pub fn airdrop(&self, pubkey: &Pubkey, lamports: u64) -> Result<(), BankError> {
+        self.credit(pubkey, lamports)
     }
 }
 
@@ -424,10 +426,20 @@ pub struct BlockExecution {
     pub fees: u64,
     /// Block reward minted to the miner.
     pub reward: u64,
+    /// Per-transaction outcomes, aligned 1:1 with the input transactions.
+    pub outcomes: Vec<TxOutcome>,
+}
+
+impl BlockExecution {
     /// Number of transactions that committed successfully.
-    pub executed: usize,
+    pub fn executed(&self) -> usize {
+        self.outcomes.iter().filter(|o| o.succeeded).count()
+    }
+
     /// Number of transactions that failed or were rejected.
-    pub failed: usize,
+    pub fn failed(&self) -> usize {
+        self.outcomes.iter().filter(|o| !o.succeeded).count()
+    }
 }
 
 #[cfg(test)]
@@ -506,7 +518,7 @@ mod tests {
         };
 
         let (exec_a, miner_a, recip_a) = run("blk_a");
-        assert_eq!(exec_a.executed, 1);
+        assert_eq!(exec_a.executed(), 1);
         assert_eq!(exec_a.fees, LAMPORTS_PER_SIGNATURE);
         assert_eq!(recip_a, amount);
         // miner gets the newly-minted reward plus recycled fees.
