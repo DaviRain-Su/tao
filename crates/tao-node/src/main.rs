@@ -82,12 +82,10 @@ enum Command {
         #[arg(long)]
         faucet_keypair: Option<PathBuf>,
         /// Use the utility-gated matmul-PoUW as the chain's block PoW: the work is
-        /// a genesis-committed model's layer (not free matrices). Overrides --matmul.
+        /// the genesis-committed model's layer (not free matrices). Overrides
+        /// --matmul. The model (size, tiles, weights) comes from genesis `[pouw]`.
         #[arg(long)]
         pouw: bool,
-        /// Number of weight tiles (layers) in the demo PoUW model.
-        #[arg(long, default_value_t = 8)]
-        pouw_tiles: usize,
     },
     /// Mine a single-node blockDAG (GHOSTDAG + reachability + SVM linearization).
     DagMine {
@@ -170,7 +168,6 @@ fn main() -> anyhow::Result<()> {
             matmul_rank,
             pow_switch_height,
             pouw,
-            pouw_tiles,
         } => run(RunArgs {
             config,
             data_dir,
@@ -187,7 +184,6 @@ fn main() -> anyhow::Result<()> {
             matmul_rank,
             pow_switch_height,
             pouw,
-            pouw_tiles,
         }),
         Command::DagMine {
             data_dir,
@@ -618,7 +614,6 @@ struct RunArgs {
     matmul_rank: Option<usize>,
     pow_switch_height: Option<u64>,
     pouw: bool,
-    pouw_tiles: usize,
 }
 
 /// Read a Solana-style keypair file (JSON array of 64 bytes).
@@ -686,11 +681,29 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let rank = args.matmul_rank.unwrap_or(default_rank);
 
     let pow: Arc<dyn tao_consensus::PowAlgorithm> = if args.pouw {
-        // Utility-gated matmul-PoUW: the block PoW is a genesis-committed model's
-        // layer applied to a per-block input (real model computation, not free
-        // matrices). All nodes share the same demo model → same model id.
-        let gate = tao_pouw::UtilityGatePow::demo("tao-pouw-model", n, rank, args.pouw_tiles);
-        tracing::info!(model_id = %hex_bytes(&gate.model_id()), n, rank, tiles = args.pouw_tiles, "utility-gated matmul-PoUW consensus");
+        // Utility-gated matmul-PoUW: the block PoW is the *genesis-committed*
+        // model's layer applied to a per-block input (real model computation, not
+        // free matrices). The model is derived deterministically from the genesis
+        // weight seed, so every node agrees on the exact model and its id.
+        let mp = genesis
+            .pouw
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--pouw requires a [pouw] model committed in genesis"))?;
+        let seed = tao_consensus::genesis::parse_target(&mp.weight_seed)
+            .map_err(|e| anyhow::anyhow!("bad pouw weight_seed: {e}"))?;
+        let gate = tao_pouw::UtilityGatePow::from_seed(&mp.name, mp.n, mp.rank, mp.tiles, seed);
+        let derived = hex_bytes(&gate.model_id());
+        if let Some(expected) = &mp.model_id {
+            if &derived != expected {
+                return Err(anyhow::anyhow!(
+                    "pouw model id mismatch: genesis pins {expected} but derived {derived}"
+                ));
+            }
+        }
+        tracing::info!(
+            model = %mp.name, model_id = %derived, n = mp.n, rank = mp.rank, tiles = mp.tiles,
+            "utility-gated matmul-PoUW consensus (genesis-committed model)"
+        );
         Arc::new(gate)
     } else if let Some(switch_h) = args.pow_switch_height {
         // Blake3 (fair launch / CPU) until switch_h, then matmul-PoUW.

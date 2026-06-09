@@ -110,6 +110,22 @@ impl UtilityGatePow {
         Self::from_weights(name, n, rank, weights)
     }
 
+    /// Derive a model deterministically from a 32-byte `seed` — the genesis-
+    /// committed form: every node computes identical weights (hence an identical
+    /// model id) from the seed in the genesis config, without shipping the weights.
+    pub fn from_seed(name: &str, n: usize, rank: usize, tiles: usize, seed: [u8; 32]) -> Self {
+        let weights: Vec<Vec<i64>> = (0..tiles)
+            .map(|t| {
+                let mut h = blake3::Hasher::new();
+                h.update(b"tao-weight-tile");
+                h.update(&seed);
+                h.update(&(t as u64).to_le_bytes());
+                gemm::fill(h.finalize().as_bytes(), 0, n * n)
+            })
+            .collect();
+        Self::from_weights(name, n, rank, weights)
+    }
+
     /// The model id = Merkle commitment over the weight tiles.
     pub fn model_id(&self) -> [u8; 32] {
         self.model_id
