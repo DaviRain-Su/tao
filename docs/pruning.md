@@ -105,6 +105,38 @@ pruning point descends from genesis on a real chain, before adopting its snapsho
 Tested: `snapshot_sync_bootstraps_a_fresh_node` (verified bootstrap),
 `import_rejects_invalid_proof`, `rejects_forged_interlink`.
 
+## Audit Notes (items 11/13)
+
+### 11) `prune_finalized_transactions` durability contract
+
+This API is explicitly **in-memory only**: it drops transaction bodies from
+`block_txs` for finalized-prefix blocks to bound hot memory, but it does **not**
+compact `dag.log`. The checkpoint snapshot remains the full replay source, so
+after restart the full log replay restores those dropped bodies. In practice:
+
+- immediate effect: memory drops, state rebuild stays consistent via
+  `virtual_state` + checkpoint;
+- durable effect: none, until `prune` runs and rewrites the log (`Snapshot + suffix`)
+  to drop headers/blocks permanently.
+
+Implemented in `DagChain::prune_finalized_transactions` and documented in its
+method docstring.
+
+### 13) Serialization production-path robustness
+
+The production panic risk on header/block-serialization failure is reduced in
+the Dag consensus path:
+
+- `BlockHeader::serialize` and `DagBlockHeader::serialize` in
+  `crates/tao-consensus/src/block.rs` now use
+  `unwrap_or_else(|e| { warn!; Vec::new() })` instead of `expect`.
+- Dag path persistence/deserialization in `crates/tao-dagvm/src/dag_chain.rs`
+  follows the same pattern where practical.
+
+So the specific review risk (hard panic on serialization failure in this path) is
+addressed, while still leaving intentionally non-critical fallbacks to surface via
+logs.
+
 ### Remaining refinements (not blocking)
 
 - **Most-work selection across competing peers.** A joiner currently adopts the

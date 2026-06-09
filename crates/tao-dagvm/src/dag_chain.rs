@@ -188,6 +188,16 @@ pub struct DagChain {
     /// accumulated PoW. Built before pruning (while ancestors exist) and shipped
     /// to bootstrapping peers. Empty until the chain has pruned.
     proof: Vec<DagBlockHeader>,
+    /// True only if this node bootstrapped from a peer's snapshot (vs pruning its
+    /// own genesis-rooted chain). A bootstrapped node may switch to a peer proof
+    /// with strictly more work; a self-pruned node never adopts a peer snapshot.
+    bootstrapped: bool,
+    /// Accumulated work of the proof this node bootstrapped from (most-work rule).
+    bootstrap_work: primitive_types::U256,
+    /// The original chain genesis id (never changes under re-anchor/bootstrap).
+    /// Pruning proofs always anchor here, so a bootstrapped node can still verify
+    /// a competing peer's proof.
+    original_genesis: [u8; 32],
 }
 
 /// A finalized state snapshot: the account set after executing the first `len`
@@ -200,10 +210,6 @@ struct Checkpoint {
 
 /// Blocks kept beyond the checkpoint before it advances (finality margin).
 const DEFAULT_FINALITY_DEPTH: u64 = 100;
-
-/// NiPoPoW security parameter: how many blocks per level the proof retains before
-/// advancing the anchor (more = harder to forge, larger proof).
-const PROOF_SECURITY_M: usize = 10;
 
 impl DagChain {
     /// Open (or create) a DAG chain under `data_dir` with **fixed** difficulty.
@@ -288,6 +294,9 @@ impl DagChain {
             checkpoint_dir: data_dir.join("checkpoint"),
             history_pruned: false,
             proof: Vec::new(),
+            bootstrapped: false,
+            bootstrap_work: primitive_types::U256::zero(),
+            original_genesis: genesis_id,
         };
 
         // Replay the log: a leading snapshot (from a prune) re-anchors the chain,
@@ -367,89 +376,36 @@ impl DagChain {
             .unwrap_or(self.genesis_dag)
     }
 
-    /// Build a succinct NiPoPoW proof for `p` (the NiPoPoW "Prove" shape): process
-    /// levels high→low; at each level collect the level-≥μ chain from `p` back to a
-    /// moving anchor, then advance the anchor `m` blocks toward `p` so lower levels
-    /// only densify the recent part. The result covers deep history with rare
-    /// high-level blocks and recent history densely — `O(m·log(work))` headers,
-    /// interlink-connected and anchored at genesis. Must run before `p`'s ancestors
-    /// are pruned.
+    /// Build a succinct NiPoPoW proof for `p`: walk the highest-level interlink
+    /// back-pointer at each step from `p` until genesis (empty interlink). Each
+    /// jump is the longest available, so the proof is logarithmic-ish in the work
+    /// yet always interlink-connected (consecutive headers are linked by the
+    /// followed pointer) and anchored at genesis. A longer chain yields a longer
+    /// walk (more high-level blocks ⇒ more certified work), which is what the
+    /// most-work comparison relies on. Must run before `p`'s ancestors are pruned.
     fn build_proof_for(&self, p: [u8; 32]) -> Vec<DagBlockHeader> {
-        let genesis = self.genesis_dag.to_bytes();
-        let p_header = match self.headers.get(&p) {
-            Some(h) => h.clone(),
-            None => return Vec::new(),
-        };
-        let max_level = p_header.interlink.len();
-        let mut included: HashSet<[u8; 32]> = HashSet::new();
-        let mut collected: Vec<DagBlockHeader> = Vec::new();
-        let mut anchor = genesis;
-        for mu in (0..max_level).rev() {
-            let seg = self.level_segment(p, mu, anchor, genesis);
-            for h in &seg {
-                if included.insert(h.id()) {
-                    collected.push(h.clone());
-                }
-            }
-            if seg.len() > PROOF_SECURITY_M {
-                anchor = seg[PROOF_SECURITY_M].id(); // m blocks back from p
-            }
-            if anchor == p {
-                break;
-            }
-        }
-        // Always include the genesis anchor.
-        if let Some(g) = self.headers.get(&genesis) {
-            if included.insert(genesis) {
-                collected.push(g.clone());
-            }
-        }
-        // Topological (genesis-first) order via blue score (available pre-prune).
-        collected.sort_by_key(|h| self.engine.blue_score(DagHash::from_bytes(h.id())));
-        collected
-    }
-
-    /// The level-≥`mu` chain from `p` back to (and including) `anchor`, following
-    /// `interlink[mu]`. `p`-first. Stops once it passes `anchor`.
-    fn level_segment(
-        &self,
-        p: [u8; 32],
-        mu: usize,
-        anchor: [u8; 32],
-        genesis: [u8; 32],
-    ) -> Vec<DagBlockHeader> {
-        let mut out = Vec::new();
+        let mut proof = Vec::new();
         let mut cur = p;
-        // Interlink ancestors lie on the selected chain, so blue score is
-        // monotonic along the walk — compare it (a cheap map lookup) instead of a
-        // reachability query to decide when we've reached the anchor.
-        let anchor_score = self.engine.blue_score(DagHash::from_bytes(anchor));
+        let mut guard = 0usize;
         loop {
-            // Include `cur` only while it is at or after the anchor.
-            let after_anchor = cur == anchor
-                || anchor == genesis
-                || self.engine.blue_score(DagHash::from_bytes(cur)) >= anchor_score;
-            if !after_anchor {
-                break;
-            }
             let h = match self.headers.get(&cur) {
                 Some(h) => h.clone(),
-                None => break,
+                None => break, // ancestor already pruned — proof can't reach genesis
             };
-            out.push(h.clone());
-            if cur == anchor {
+            let interlink = h.interlink.clone();
+            proof.push(h);
+            match interlink.last() {
+                None => break, // genesis (empty interlink)
+                Some(&next) if next == cur => break,
+                Some(&next) => cur = next, // jump to the highest-level ancestor
+            }
+            guard += 1;
+            if guard > 1_000_000 {
                 break;
             }
-            if mu >= h.interlink.len() {
-                break; // no level-≥mu ancestor (reached the bottom of this level)
-            }
-            let next = h.interlink[mu];
-            if next == cur {
-                break;
-            }
-            cur = next;
         }
-        out
+        proof.reverse(); // genesis-first
+        proof
     }
 
     /// The NiPoPoW interlink a block built on selected parent `sp` must commit to:
@@ -942,9 +898,19 @@ impl DagChain {
             return Ok(false);
         }
         // Trustless check: the NiPoPoW proof must certify, by PoW alone, that the
-        // origin descends from our genesis on a real chain. (Most-work selection
-        // across competing peers is the node's job; here we verify validity.)
-        let _work = verify_proof(&snap.proof, origin, self.genesis_dag.to_bytes())?;
+        // origin descends from our genesis on a real chain, and tell us its work.
+        // Anchor at the original genesis (a bootstrapped node's genesis_dag has
+        // moved to its current pruning point).
+        let work = verify_proof(&snap.proof, origin, self.original_genesis)?;
+
+        // Most-work selection: a fresh node (only genesis, never pruned) adopts; a
+        // node already bootstrapped from a peer switches only to a strictly
+        // greater-work proof; a node that built/pruned its own chain never adopts.
+        let fresh = self.block_count() == 1 && !self.history_pruned;
+        let stronger = self.bootstrapped && work > self.bootstrap_work;
+        if !fresh && !stronger {
+            return Ok(false);
+        }
 
         self.load_snapshot(
             snap.origin_header.clone(),
@@ -970,6 +936,8 @@ impl DagChain {
             );
         }
         self.log.replace_all(&records).map_err(|e| e.to_string())?;
+        self.bootstrapped = true;
+        self.bootstrap_work = work;
         Ok(true)
     }
 
@@ -1914,6 +1882,51 @@ mod tests {
         );
         // Re-importing is a no-op (already have the origin).
         assert!(!node2.import_snapshot(&snap).unwrap());
+    }
+
+    #[test]
+    fn most_work_proof_wins() {
+        // A fresh node ends up on the higher-work chain regardless of the order in
+        // which competing peers' snapshots arrive; a lower-work proof is refused.
+        let miner = Pubkey::new_unique();
+        let build = |tag: &str, n: usize| {
+            let mut c = DagChain::open_with_daa(dir(tag), 3, easy_target(), miner, 0, vec![], 10, 5)
+                .unwrap();
+            c.set_finality_depth(2);
+            // Mine after the genesis timestamp so solve times are uniform (no
+            // negative-solvetime difficulty bump): both chains share difficulty, so
+            // the longer one certifies strictly more accumulated work.
+            let mut ts = 1_750_000_010i64;
+            for _ in 0..n {
+                c.mine_at(&[], ts).unwrap();
+                ts += 10;
+            }
+            c.prune().unwrap();
+            c
+        };
+        let small = build("mw-small", 16);
+        let large = build("mw-large", 48);
+        let snap_small = small.export_snapshot().unwrap();
+        let snap_large = large.export_snapshot().unwrap();
+
+        let fresh = |tag: &str| {
+            let mut c = DagChain::open_with_daa(dir(tag), 3, easy_target(), miner, 0, vec![], 10, 5)
+                .unwrap();
+            c.set_finality_depth(2);
+            c
+        };
+
+        // small then large → upgrades to the higher-work chain.
+        let mut n1 = fresh("mw-n1");
+        assert!(n1.import_snapshot(&snap_small).unwrap(), "fresh node adopts first proof");
+        assert!(n1.import_snapshot(&snap_large).unwrap(), "switches to the stronger proof");
+        assert_eq!(n1.total_order(), large.total_order(), "n1 ends on the large chain");
+
+        // large then small → keeps the higher-work chain.
+        let mut n2 = fresh("mw-n2");
+        assert!(n2.import_snapshot(&snap_large).unwrap());
+        assert!(!n2.import_snapshot(&snap_small).unwrap(), "weaker proof refused");
+        assert_eq!(n2.total_order(), large.total_order(), "n2 keeps the large chain");
     }
 
     #[test]
