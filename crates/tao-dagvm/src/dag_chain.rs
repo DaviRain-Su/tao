@@ -7,8 +7,12 @@
 //! "rebuild from the log" approach). Incremental virtual-state processing is the
 //! production optimization.
 //!
-//! Difficulty is fixed (from genesis) for now; a sampled-window DAA for high
-//! block rates is future work.
+//! Difficulty adjusts per block with an **LWMA** over the GHOSTDAG selected
+//! chain (the heaviest chain of selected parents). This reuses the same,
+//! already-tested [`tao_consensus::next_target`] LWMA the linear chain uses,
+//! sampling the selected-parent chain by ascending blue score. [`DagChain::open`]
+//! keeps difficulty fixed (window = `u64::MAX` ⇒ permanent warmup); use
+//! [`DagChain::open_with_daa`] to enable adjustment.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -20,7 +24,9 @@ use solana_account::AccountSharedData;
 use solana_hash::Hash as Blockhash;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
-use tao_consensus::{meets_target, tx_merkle_root, Target};
+use tao_consensus::{
+    meets_target, next_target, tx_merkle_root, BlockHeader as ConsHeader, DifficultyParams, Target,
+};
 use tao_database::{AccountsDb, BlockLog};
 use tao_ghostdag::{blockhash, DagEngine, Hash as DagHash};
 use tao_runtime::{Bank, BankError};
@@ -73,8 +79,14 @@ pub struct DagChain {
     tips: Vec<[u8; 32]>,
     blocks: HashSet<[u8; 32]>,
     block_txs: HashMap<[u8; 32], Vec<Transaction>>,
+    /// Headers of every accepted block (incl. genesis), for DAA chain sampling.
+    headers: HashMap<[u8; 32], DagBlockHeader>,
     genesis_dag: DagHash,
-    target: Target,
+    genesis_target: Target,
+    /// Desired seconds per block (LWMA `T`).
+    block_time_secs: u64,
+    /// LWMA window in blocks (`u64::MAX` ⇒ difficulty held fixed).
+    lwma_window: u64,
     miner: Pubkey,
     reward: u64,
     accounts_dir: PathBuf,
@@ -82,7 +94,8 @@ pub struct DagChain {
 }
 
 impl DagChain {
-    /// Open (or create) a DAG chain under `data_dir`. The block log is replayed.
+    /// Open (or create) a DAG chain under `data_dir` with **fixed** difficulty.
+    /// The block log is replayed.
     pub fn open(
         data_dir: PathBuf,
         k: u16,
@@ -91,13 +104,31 @@ impl DagChain {
         reward: u64,
         allocations: Vec<(Pubkey, u64)>,
     ) -> Result<Self, String> {
+        // window = u64::MAX ⇒ next_target is always in "warmup" ⇒ fixed target.
+        Self::open_with_daa(data_dir, k, target, miner, reward, allocations, 10, u64::MAX)
+    }
+
+    /// Open (or create) a DAG chain with LWMA difficulty adjustment over the
+    /// selected chain: `block_time_secs` is the desired seconds per block and
+    /// `lwma_window` is the averaging window (in blocks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_daa(
+        data_dir: PathBuf,
+        k: u16,
+        genesis_target: Target,
+        miner: Pubkey,
+        reward: u64,
+        allocations: Vec<(Pubkey, u64)>,
+        block_time_secs: u64,
+        lwma_window: u64,
+    ) -> Result<Self, String> {
         // Deterministic genesis header (no parents, no txs).
         let genesis_header = DagBlockHeader {
             version: HEADER_VERSION,
             parents: vec![],
             timestamp: 1_750_000_000,
             tx_merkle_root: [0u8; 32],
-            target,
+            target: genesis_target,
             nonce: 0,
             miner: [0u8; 32],
         };
@@ -115,8 +146,11 @@ impl DagChain {
             tips: vec![genesis_id],
             blocks: HashSet::from([genesis_id]),
             block_txs: HashMap::new(),
+            headers: HashMap::from([(genesis_id, genesis_header)]),
             genesis_dag,
-            target,
+            genesis_target,
+            block_time_secs,
+            lwma_window,
             miner,
             reward,
             accounts_dir: data_dir.join("accounts"),
@@ -132,24 +166,68 @@ impl DagChain {
         Ok(chain)
     }
 
+    /// The target for the next block: an LWMA over the GHOSTDAG selected chain
+    /// (ascending blue score). During warmup (or fixed mode) this returns the
+    /// genesis / current target. Reuses [`tao_consensus::next_target`].
+    pub fn next_target(&self) -> Target {
+        // The next block's selected parent is the current heaviest tip.
+        let mut cur = self.engine.tip();
+        let take = (self.lwma_window as usize).saturating_add(1);
+        let mut chain: Vec<DagHash> = Vec::new();
+        loop {
+            chain.push(cur);
+            if chain.len() >= take || cur == self.genesis_dag {
+                break;
+            }
+            cur = self.engine.selected_parent(cur);
+        }
+        chain.reverse(); // ascending blue score (genesis-most first)
+
+        let headers: Vec<ConsHeader> = chain
+            .iter()
+            .filter_map(|h| self.headers.get(&h.to_bytes()))
+            .map(|h| ConsHeader {
+                version: h.version,
+                prev_hash: Blockhash::default(),
+                height: 0,
+                timestamp: h.timestamp,
+                tx_merkle_root: Blockhash::default(),
+                state_root: Blockhash::default(),
+                target: h.target,
+                nonce: 0,
+                miner: Pubkey::default(),
+            })
+            .collect();
+
+        let params = DifficultyParams::new(self.block_time_secs.max(1), self.lwma_window.max(2));
+        next_target(&headers, &params, &self.genesis_target)
+    }
+
     fn now() -> i64 {
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
     }
 
     /// Build a PoW block referencing the current tips with the given transactions.
     pub fn build_block(&self, transactions: &[Transaction]) -> DagBlock {
+        self.build_block_at(transactions, Self::now())
+    }
+
+    /// Like [`Self::build_block`] but with an explicit header timestamp (used to
+    /// test the DAA deterministically without relying on wall-clock spacing).
+    pub fn build_block_at(&self, transactions: &[Transaction], timestamp: i64) -> DagBlock {
         let serialized: Vec<Vec<u8>> =
             transactions.iter().map(|t| bincode::serialize(t).expect("tx serialize")).collect();
+        let target = self.next_target();
         let mut header = DagBlockHeader {
             version: HEADER_VERSION,
             parents: self.tips.clone(),
-            timestamp: Self::now(),
+            timestamp,
             tx_merkle_root: tx_merkle_root(&serialized).to_bytes(),
-            target: self.target,
+            target,
             nonce: 0,
             miner: self.miner.to_bytes(),
         };
-        while !meets_target(&header.id(), &self.target) {
+        while !meets_target(&header.id(), &target) {
             header.nonce = header.nonce.wrapping_add(1);
         }
         DagBlock { header, transactions: serialized }
@@ -157,7 +235,12 @@ impl DagChain {
 
     /// Mine a block (build + persist + apply).
     pub fn mine(&mut self, transactions: &[Transaction]) -> Result<DagBlock, String> {
-        let block = self.build_block(transactions);
+        self.mine_at(transactions, Self::now())
+    }
+
+    /// Mine a block with an explicit header timestamp.
+    pub fn mine_at(&mut self, transactions: &[Transaction], timestamp: i64) -> Result<DagBlock, String> {
+        let block = self.build_block_at(transactions, timestamp);
         self.log.append(&bincode::serialize(&block).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         self.apply(&block)?;
         Ok(block)
@@ -197,6 +280,7 @@ impl DagChain {
         if !txs.is_empty() {
             self.block_txs.insert(id, txs);
         }
+        self.headers.insert(id, block.header.clone());
         self.blocks.insert(id);
 
         // Tips: drop the referenced parents, add the new block.
@@ -400,5 +484,67 @@ mod tests {
         let r1 = c1.rebuild_state().unwrap().state_root().unwrap();
         let r2 = c2.rebuild_state().unwrap().state_root().unwrap();
         assert_eq!(r1, r2, "miners converge on one state");
+    }
+
+    #[test]
+    fn daa_raises_difficulty_on_fast_blocks() {
+        use tao_consensus::work_for_target;
+        let miner = Pubkey::new_unique();
+        // block_time = 10s, window = 5. Mine `window + 1` blocks 1s apart (fast)
+        // — all mined during warmup at the easy genesis target, so each grind is
+        // cheap — then the *next* target must be harder than genesis.
+        let window = 5u64;
+        let mut chain = DagChain::open_with_daa(
+            dir("daa-fast"),
+            3,
+            easy_target(),
+            miner,
+            0,
+            vec![],
+            10,
+            window,
+        )
+        .unwrap();
+        // During warmup next_target == genesis target.
+        assert_eq!(chain.next_target(), easy_target(), "warmup holds genesis target");
+        let base = 2_000_000i64;
+        for i in 0..=window {
+            chain.mine_at(&[], base + (i as i64)).unwrap(); // 1s apart
+        }
+        // Now the selected chain has window+1 non-genesis blocks → past warmup.
+        let nt = chain.next_target();
+        assert!(
+            work_for_target(&nt) > work_for_target(&easy_target()),
+            "fast blocks raise difficulty (more work than genesis)"
+        );
+    }
+
+    #[test]
+    fn daa_holds_steady_on_time() {
+        use tao_consensus::work_for_target;
+        let miner = Pubkey::new_unique();
+        // Blocks arriving exactly on time (10s apart) keep difficulty ~stable.
+        let window = 5u64;
+        let mut chain = DagChain::open_with_daa(
+            dir("daa-steady"),
+            3,
+            easy_target(),
+            miner,
+            0,
+            vec![],
+            10,
+            window,
+        )
+        .unwrap();
+        let base = 3_000_000i64;
+        for i in 0..=window {
+            chain.mine_at(&[], base + (i as i64) * 10).unwrap(); // exactly on time
+        }
+        let nt = chain.next_target();
+        let wg = work_for_target(&easy_target());
+        let wn = work_for_target(&nt);
+        // within ~5% of the genesis difficulty
+        assert!(wn >= wg * primitive_types::U256::from(95u64) / primitive_types::U256::from(100u64));
+        assert!(wn <= wg * primitive_types::U256::from(105u64) / primitive_types::U256::from(100u64));
     }
 }

@@ -28,3 +28,4 @@ solana-system-interface.workspace = true
 solana-account.workspace = true
 solana-pubkey.workspace = true
 solana-sdk-ids.workspace = true
+primitive-types.workspace = true

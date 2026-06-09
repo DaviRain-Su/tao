@@ -169,13 +169,15 @@ fn dag_open(
                 .map_err(|e| anyhow::anyhow!("bad allocation '{}': {e}", a.address))
         })
         .collect::<anyhow::Result<_>>()?;
-    let chain = tao_dagvm::DagChain::open(
+    let chain = tao_dagvm::DagChain::open_with_daa(
         data_dir,
         k,
         target,
         miner_pubkey,
         genesis.reward.initial_lamports,
         allocations,
+        genesis.pow.target_block_time_secs,
+        genesis.pow.lwma_window,
     )
     .map_err(|e| anyhow::anyhow!("open dag chain: {e}"))?;
     Ok((chain, miner_pubkey))
@@ -292,42 +294,7 @@ fn dag_run(
 /// Mine a single-node blockDAG using the ported reachability + GHOSTDAG, with
 /// state computed by executing the GHOSTDAG total order through the SVM.
 fn dag_mine(data_dir: PathBuf, miner: String, blocks: u64, k: u16) -> anyhow::Result<()> {
-    use std::str::FromStr;
-
-    std::fs::create_dir_all(&data_dir)?;
-    let genesis_path = data_dir.join("genesis.toml");
-    let genesis = if genesis_path.exists() {
-        GenesisConfig::load(&genesis_path)?
-    } else {
-        let g = GenesisConfig::devnet();
-        std::fs::write(&genesis_path, g.to_toml()?)?;
-        g
-    };
-
-    let miner_pubkey = Pubkey::from_str(&miner)
-        .map_err(|e| anyhow::anyhow!("invalid miner address '{miner}': {e}"))?;
-    let target = tao_consensus::genesis::parse_target(&genesis.pow.initial_target)
-        .map_err(|e| anyhow::anyhow!("bad genesis target: {e}"))?;
-
-    let allocations: Vec<(Pubkey, u64)> = genesis
-        .allocations
-        .iter()
-        .map(|a| {
-            Pubkey::from_str(&a.address)
-                .map(|pk| (pk, a.lamports))
-                .map_err(|e| anyhow::anyhow!("bad allocation '{}': {e}", a.address))
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    let mut chain = tao_dagvm::DagChain::open(
-        data_dir,
-        k,
-        target,
-        miner_pubkey,
-        genesis.reward.initial_lamports,
-        allocations,
-    )
-    .map_err(|e| anyhow::anyhow!("open dag chain: {e}"))?;
+    let (mut chain, miner_pubkey) = dag_open(data_dir, &miner, k)?;
 
     for _ in 0..blocks {
         chain.mine(&[]).map_err(|e| anyhow::anyhow!("mine: {e}"))?;

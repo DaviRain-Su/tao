@@ -3956,6 +3956,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "primitive-types",
  "serde",
  "solana-account",
  "solana-hash 4.2.0",
