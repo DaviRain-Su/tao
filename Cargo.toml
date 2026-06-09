@@ -14,6 +14,7 @@ rust-version = "1.81"
 # ---- internal crates ----
 tao-core = { path = "crates/tao-core" }
 tao-consensus = { path = "crates/tao-consensus" }
+tao-dagvm = { path = "crates/tao-dagvm" }
 tao-ghostdag = { path = "crates/tao-ghostdag" }
 tao-pouw = { path = "crates/tao-pouw" }
 tao-reachability = { path = "crates/tao-reachability" }

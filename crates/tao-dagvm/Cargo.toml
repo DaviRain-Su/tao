@@ -1,0 +1,23 @@
+[package]
+name = "tao-dagvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Execute a blockDAG's transactions through the SVM in GHOSTDAG linear order"
+
+[dependencies]
+tao-ghostdag.workspace = true
+tao-runtime.workspace = true
+tao-database.workspace = true
+solana-transaction.workspace = true
+solana-hash.workspace = true
+
+[dev-dependencies]
+solana-keypair.workspace = true
+solana-signer.workspace = true
+solana-system-interface.workspace = true
+solana-account.workspace = true
+solana-pubkey.workspace = true
+solana-sdk-ids.workspace = true
