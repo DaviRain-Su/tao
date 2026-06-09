@@ -20,6 +20,7 @@ solana-sdk-ids.workspace = true
 serde.workspace = true
 bincode.workspace = true
 blake3.workspace = true
+primitive-types.workspace = true
 
 [dev-dependencies]
 solana-keypair.workspace = true

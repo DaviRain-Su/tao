@@ -72,27 +72,38 @@ with `P` the deepest selected-chain block satisfying it.
   apply the trusted suffix + write a compacted log. `dag-run` requests a snapshot
   when block backfill stalls on pruned ancestors.
 
-## Remaining gap to full Kaspa parity: the trustless pruning proof
+## Trustless pruning proof (NiPoPoW) — done
 
-The shipped snapshot is currently *trusted* (adopted like a checkpoint). Kaspa
-makes it trustless with a PoW **pruning-point proof** (a NiPoPoW): a succinct set
-of headers that certifies the pruning point lies on the most-work chain, without
-the pruned history. The foundation — the **block level** (`pow_level`, how many
-extra zero bits a PoW hash cleared, so a 2^level-rarer event) — is implemented.
-Completing the proof is a focused, security-critical milestone:
+Bootstrap is now trustless: a syncing node verifies, by PoW alone, that the
+pruning point descends from genesis on a real chain, before adopting its snapshot.
 
-1. **Interlinks (header change).** Each header commits to an `interlink` vector:
-   `interlink[k]` = the most recent selected ancestor of level ≥ k. Computed at
-   mine time from the selected parent: `new = sp.interlink` with `interlink[k] =
-   sp` for all `k ≤ level(sp)`. PoW commits to it (so it can't be forged), and
-   `accept` must re-derive and validate it (else the proof is unsound).
-2. **Proof construction (retained before pruning).** Walk interlinks at the
-   highest level μ that still has ≥ m blocks from genesis to P, collecting those
-   headers — `O(m·log(work))` headers, small enough to retain after pruning.
-3. **Verification.** A syncing node checks each proof header's PoW and level, that
-   they form an interlink-connected chain genesis→P, and accepts the proof with
-   the most accumulated work (NiPoPoW "most-work" rule) — then adopts that P's
-   snapshot. This replaces the trusted-suffix application with a verified one.
+1. **Block level (`pow_level`).** How many extra leading zero bits a PoW hash
+   cleared beyond its target — level k ⇒ a 2^k-rarer solution. High-level blocks
+   sample accumulated work, making the proof succinct.
+2. **Interlinks (`DagBlockHeader.interlink`).** `interlink[k]` = the most recent
+   selected ancestor of level ≥ k. Computed at build time from the selected
+   parent (`interlink_for_parent`), PoW-committed, and **validated in `accept`**
+   so it can't be forged.
+3. **Proof construction (`build_proof_for`).** Built before pruning (while
+   ancestors exist) and retained: walk the highest-level interlink back-pointer
+   from P until genesis — an interlink-connected, genesis-anchored header chain
+   whose length is logarithmic-ish in the work.
+4. **Verification (`verify_proof`).** A joiner checks the proof is anchored at its
+   own genesis, ends at the claimed origin, every non-genesis header has valid
+   PoW, and consecutive headers are interlink/parent-connected; it returns the
+   accumulated work. `import_snapshot` runs this before adopting a snapshot.
 
-This touches the header, the mining path, and `accept` validation, so it is left
-as a dedicated step rather than folded into the pruning work above.
+Tested: `snapshot_sync_bootstraps_a_fresh_node` (verified bootstrap),
+`import_rejects_invalid_proof`, `rejects_forged_interlink`.
+
+### Remaining refinements (not blocking)
+
+- **Optimal succinctness / security bounds.** The proof uses the highest-interlink
+  walk; the full NiPoPoW "goodness" construction (guaranteed `O(polylog)` size and
+  formal security parameters) and **most-work selection across competing peers**
+  (a joiner currently adopts the first valid proof — fine under one honest peer)
+  are refinements.
+- **Multi-prune proof chaining.** A genesis-anchored proof is rebuilt at each
+  prune; once a node has pruned twice, the older ancestors are gone, so the proof
+  anchors at genesis only while built from headers that still reach it. Chaining
+  successive proofs across repeated prunes is a refinement.
