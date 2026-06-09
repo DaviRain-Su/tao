@@ -24,8 +24,8 @@ use solana_hash::Hash as Blockhash;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use tao_consensus::{
-    meets_target, next_target, tx_merkle_root, BlockHeader as ConsHeader, DagBlock, DagBlockHeader,
-    DifficultyParams, Target, HEADER_VERSION,
+    meets_target, next_target, pow_level, tx_merkle_root, BlockHeader as ConsHeader, DagBlock,
+    DagBlockHeader, DifficultyParams, Target, HEADER_VERSION,
 };
 use tao_database::{AccountsDb, BlockLog};
 use tao_ghostdag::{blockhash, DagEngine, Hash as DagHash};
@@ -147,6 +147,7 @@ impl DagChain {
             tx_merkle_root: Blockhash::default(),
             state_root: Blockhash::default(),
             target: genesis_target,
+            interlink: Vec::new(),
             nonce: 0,
             miner: Pubkey::default(),
         };
@@ -212,15 +213,39 @@ impl DagChain {
     /// GHOSTDAG's `find_selected_parent`, so every node computes the same target
     /// and a miner cannot lowball difficulty by referencing a weaker parent.
     pub fn expected_target(&self, parents: &[[u8; 32]]) -> Target {
-        let sp = parents
+        self.selected_chain_target(self.selected_parent_dag(parents))
+    }
+
+    /// The GHOSTDAG selected parent of a block referencing `parents`: the parent
+    /// with greatest blue work (ties by larger hash) — matching the engine.
+    fn selected_parent_dag(&self, parents: &[[u8; 32]]) -> DagHash {
+        parents
             .iter()
             .copied()
             .map(DagHash::from_bytes)
             .map(|p| (self.engine.data(p).blue_work, p))
             .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
             .map(|(_, p)| p)
-            .unwrap_or(self.genesis_dag);
-        self.selected_chain_target(sp)
+            .unwrap_or(self.genesis_dag)
+    }
+
+    /// The NiPoPoW interlink a block built on selected parent `sp` must commit to:
+    /// `sp`'s interlink with entries `0..=level(sp)` updated to point at `sp`.
+    fn interlink_for_parent(&self, sp: [u8; 32]) -> Vec<[u8; 32]> {
+        let sp_header = match self.headers.get(&sp) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        let sp_level = pow_level(&sp, &sp_header.target) as usize;
+        let mut il = sp_header.interlink.clone();
+        for k in 0..=sp_level {
+            if k < il.len() {
+                il[k] = sp;
+            } else {
+                il.push(sp);
+            }
+        }
+        il
     }
 
     /// LWMA target over the selected-parent chain ending at `selected_parent`.
@@ -272,6 +297,8 @@ impl DagChain {
         let serialized: Vec<Vec<u8>> =
             transactions.iter().map(|t| bincode::serialize(t).expect("tx serialize")).collect();
         let target = self.next_target();
+        // Selected parent of a block referencing all tips is the heaviest tip.
+        let interlink = self.interlink_for_parent(self.engine.tip().to_bytes());
         let mut header = DagBlockHeader {
             version: HEADER_VERSION,
             parents: self.tips.clone(),
@@ -279,6 +306,7 @@ impl DagChain {
             tx_merkle_root: tx_merkle_root(&serialized),
             state_root: Blockhash::default(),
             target,
+            interlink,
             nonce: 0,
             miner: self.miner,
         };
@@ -316,9 +344,15 @@ impl DagChain {
         }
         // Consensus-enforced difficulty: the block must declare exactly the
         // DAA-expected target for its parents (else PoW could be lowballed).
-        let expected = self.expected_target(&block.header.parents);
+        let sp = self.selected_parent_dag(&block.header.parents);
+        let expected = self.selected_chain_target(sp);
         if block.header.target != expected {
             return Err("unexpected difficulty target".into());
+        }
+        // The interlink must be correctly derived from the selected parent (it is
+        // PoW-committed, so a valid one proves the miner built it honestly).
+        if block.header.interlink != self.interlink_for_parent(sp.to_bytes()) {
+            return Err("invalid interlink".into());
         }
         let rec = bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?;
         self.log.append(&rec).map_err(|e| e.to_string())?;
@@ -1024,6 +1058,7 @@ mod tests {
             tx_merkle_root: tx_merkle_root(&[]),
             state_root: Blockhash::default(),
             target,
+            interlink: chain.interlink_for_parent(parent),
             nonce: 0,
             miner,
         };
@@ -1329,6 +1364,23 @@ mod tests {
         assert_eq!(served.transactions, mined.transactions, "txs round-trip");
         assert!(chain.has_block(&mined.id()));
         assert!(chain.get_block(&[9u8; 32]).is_none(), "unknown id → None");
+    }
+
+    #[test]
+    fn rejects_forged_interlink() {
+        // A block whose interlink isn't correctly derived from its selected
+        // parent is rejected (interlinks are PoW-committed and validated).
+        let miner = Pubkey::new_unique();
+        let mut chain = DagChain::open(dir("forge-il"), 3, easy_target(), miner, 0, vec![]).unwrap();
+        chain.mine(&[]).unwrap();
+        chain.mine(&[]).unwrap();
+        let mut block = chain.build_block(&[]); // correct interlink
+        block.header.interlink.push([0x42; 32]); // forge an extra pointer
+        while !meets_target(&block.header.id(), &block.header.target) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        let err = chain.accept(block).unwrap_err();
+        assert!(err.contains("interlink"), "expected interlink rejection, got: {err}");
     }
 
     #[test]

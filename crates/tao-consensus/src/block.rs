@@ -103,6 +103,11 @@ pub struct DagBlockHeader {
     pub state_root: Hash,
     /// PoW target threshold (big-endian). `pow_hash <= target` wins.
     pub target: Target,
+    /// NiPoPoW interlink: `interlink[k]` is the most recent selected ancestor of
+    /// PoW level ≥ k. Committed to by PoW and validated on accept, so it can't be
+    /// forged; it lets a pruned node retain a succinct proof of accumulated work.
+    /// Empty for genesis.
+    pub interlink: Vec<BlockId>,
     /// PoW solution nonce.
     pub nonce: u64,
     /// Address that receives this block's coinbase reward.
