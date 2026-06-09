@@ -52,17 +52,25 @@ cargo run -p tao-node -- run --mine \
   --miner 11111111111111111111111111111111 --data-dir .tao --blocks 50
 ```
 
-- **M2 — accounts + SVM execution 🚧 (runtime done)** RocksDB `AccountsDb`
-  with deterministic `state_root`; `BlockhashQueue`; genesis allocation loader;
-  and a `Bank` that **executes real Solana transactions through the embedded
-  Agave SVM** (`solana-svm` 4.0), with coinbase (block reward + recycled fees)
-  and block-level execution. Proven: a System transfer runs unchanged
-  (rent-exemption enforced) and two independent banks reach an identical state
-  root. 30 tests. Remaining: wire block execution into the miner/validator
-  pipeline (state_root in the header).
+- **M2 — accounts + SVM execution ✓** RocksDB `AccountsDb` with deterministic
+  `state_root`; `BlockhashQueue`; genesis allocation loader; and a `Bank` that
+  **executes real Solana transactions through the embedded Agave SVM**
+  (`solana-svm` 4.0), with coinbase (block reward + recycled fees) and
+  block-level execution. The miner executes each block, stamps `state_root`
+  into the header, and on restart the block log is **replayed and re-executed,
+  verifying every block's state_root**. Proven: a System transfer runs
+  unchanged (rent-exemption enforced); two independent banks reach an identical
+  state root; coinbase credits the miner per block. 31 tests.
 
-Next: finish M2 node wiring, then **M3** (deploy SPL Token + run an Anchor
-program) and **M4** (Solana-compatible JSON-RPC for Phantom / web3.js).
+Try it (watch coinbase + state_root, then restart to replay/verify):
+
+```sh
+cargo run -p tao-node -- run --mine \
+  --miner So11111111111111111111111111111111111111112 --data-dir .tao --blocks 5
+```
+
+Next: **M3** (deploy SPL Token + run an Anchor program) and **M4**
+(Solana-compatible JSON-RPC so Phantom / web3.js can submit transactions).
 
 ## License
 

@@ -3529,6 +3529,7 @@ dependencies = [
  "tao-consensus",
  "tao-core",
  "tao-database",
+ "tao-runtime",
  "tracing",
 ]
 

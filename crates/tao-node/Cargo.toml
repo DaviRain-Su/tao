@@ -15,6 +15,7 @@ path = "src/main.rs"
 tao-core.workspace = true
 tao-consensus.workspace = true
 tao-database.workspace = true
+tao-runtime.workspace = true
 clap.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
