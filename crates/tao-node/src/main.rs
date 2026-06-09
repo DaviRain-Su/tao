@@ -382,7 +382,7 @@ fn dag_open(
                 .map_err(|e| anyhow::anyhow!("bad allocation '{}': {e}", a.address))
         })
         .collect::<anyhow::Result<_>>()?;
-    let chain = tao_dagvm::DagChain::open_with_daa(
+    let chain = tao_dagvm::DagChain::open_with_genesis(
         data_dir,
         k,
         target,
@@ -391,6 +391,10 @@ fn dag_open(
         allocations,
         genesis.pow.target_block_time_secs,
         genesis.pow.lwma_window,
+        // Commit the full genesis config into the genesis id: nodes with
+        // mismatched genesis files derive different ids and reject each other's
+        // blocks outright (no silent state-root fork).
+        genesis.commitment(),
     )
     .map_err(|e| anyhow::anyhow!("open dag chain: {e}"))?;
     Ok((chain, miner_pubkey))
@@ -848,50 +852,68 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    // Determine PoW algorithm from CLI flags.
-    // Supports plain matmul, or automatic switch (HeightSwitchPow) for the M7 evolution story.
+    // The consensus PoW algorithm is a **genesis rule** (committed into the
+    // genesis id via the config hash): every node on a network derives the same
+    // PoW stack from the same genesis file. CLI flags override it for local
+    // experiments only — an overridden node forks off any network running the
+    // genesis rules, so warn loudly.
     let default_n = 8usize;
     let default_rank = 2usize;
     let use_matmul = args.matmul || args.matmul_n.is_some() || args.matmul_rank.is_some();
     let n = args.matmul_n.unwrap_or(default_n);
     let rank = args.matmul_rank.unwrap_or(default_rank);
 
-    let pow: Arc<dyn tao_consensus::PowAlgorithm> = if args.pouw {
-        // Utility-gated matmul-PoUW: the block PoW is the *genesis-committed*
-        // model's layer applied to a per-block input (real model computation, not
-        // free matrices). The model is derived deterministically from the genesis
-        // weight seed, so every node agrees on the exact model and its id.
-        let mp = genesis
-            .pouw
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("--pouw requires a [pouw] model committed in genesis"))?;
-        let seed = tao_consensus::genesis::parse_target(&mp.weight_seed)
-            .map_err(|e| anyhow::anyhow!("bad pouw weight_seed: {e}"))?;
-        let gate = tao_pouw::UtilityGatePow::from_seed(&mp.name, mp.n, mp.rank, mp.tiles, seed);
-        let derived = hex_bytes(&gate.model_id());
-        if let Some(expected) = &mp.model_id {
-            if &derived != expected {
-                return Err(anyhow::anyhow!(
-                    "pouw model id mismatch: genesis pins {expected} but derived {derived}"
-                ));
-            }
-        }
-        tracing::info!(
-            model = %mp.name, model_id = %derived, n = mp.n, rank = mp.rank, tiles = mp.tiles,
-            "utility-gated matmul-PoUW consensus (genesis-committed model)"
+    let cli_override = args.pouw || use_matmul || args.pow_switch_height.is_some();
+    let (algorithm, switch_height) = if cli_override {
+        tracing::warn!(
+            "PoW overridden by CLI flags — this node will NOT follow the genesis \
+             consensus rules; use only on throwaway local networks"
         );
-        Arc::new(gate)
-    } else if let Some(switch_h) = args.pow_switch_height {
-        // Blake3 (fair launch / CPU) until switch_h, then matmul-PoUW.
-        let before = Arc::new(Blake3Pow);
-        let after = Arc::new(tao_pouw::MatmulPow::new(n, rank));
-        Arc::new(tao_consensus::HeightSwitchPow::new(before, after, switch_h))
-    } else if use_matmul {
-        // Pure matmul-PoUW (matrix multiplication as the PoW work).
-        // Use small n/rank for CPU demos; larger values (e.g. 64,4) for GPU-like feel.
-        Arc::new(tao_pouw::MatmulPow::new(n, rank))
+        let alg = if args.pouw { "pouw" } else { "matmul" };
+        (alg.to_string(), args.pow_switch_height)
     } else {
-        Arc::new(Blake3Pow)
+        (genesis.pow.algorithm.clone(), genesis.pow.switch_height)
+    };
+
+    let base_pow: Arc<dyn tao_consensus::PowAlgorithm> = match algorithm.as_str() {
+        "pouw" => {
+            // Utility-gated matmul-PoUW: the block PoW is the *genesis-committed*
+            // model's layer applied to a per-block input (real model computation,
+            // not free matrices). The model is derived deterministically from the
+            // genesis weight seed, so every node agrees on the model and its id.
+            let mp = genesis.pouw.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("pow algorithm 'pouw' requires a [pouw] model committed in genesis")
+            })?;
+            let seed = tao_consensus::genesis::parse_target(&mp.weight_seed)
+                .map_err(|e| anyhow::anyhow!("bad pouw weight_seed: {e}"))?;
+            let gate = tao_pouw::UtilityGatePow::from_seed(&mp.name, mp.n, mp.rank, mp.tiles, seed);
+            let derived = hex_bytes(&gate.model_id());
+            if let Some(expected) = &mp.model_id {
+                if &derived != expected {
+                    return Err(anyhow::anyhow!(
+                        "pouw model id mismatch: genesis pins {expected} but derived {derived}"
+                    ));
+                }
+            }
+            tracing::info!(
+                model = %mp.name, model_id = %derived, n = mp.n, rank = mp.rank, tiles = mp.tiles,
+                "utility-gated matmul-PoUW consensus (genesis-committed model)"
+            );
+            Arc::new(gate)
+        }
+        // Plain matmul-PoUW (matrix multiplication as the PoW work). Size comes
+        // from CLI flags (genesis-committed sizing rides on the pouw model).
+        "matmul" => Arc::new(tao_pouw::MatmulPow::new(n, rank)),
+        "blake3" => Arc::new(Blake3Pow),
+        other => return Err(anyhow::anyhow!("unknown pow algorithm '{other}' in genesis")),
+    };
+    let pow: Arc<dyn tao_consensus::PowAlgorithm> = match switch_height {
+        // Blake3 (fair launch / CPU) until the committed switch height, then the
+        // genesis algorithm (the M7 evolution story).
+        Some(h) if algorithm != "blake3" => {
+            Arc::new(tao_consensus::HeightSwitchPow::new(Arc::new(Blake3Pow), base_pow, h))
+        }
+        _ => base_pow,
     };
 
     let (miner_loop, shared) = prepare(MineOptions {

@@ -60,6 +60,20 @@ pub struct PowParams {
     /// Initial difficulty target as a compact value (higher = easier).
     /// Stored as a hex-encoded 256-bit big-endian target threshold.
     pub initial_target: String,
+    /// Consensus PoW algorithm: `"blake3"` (default), `"matmul"`, or `"pouw"`
+    /// (the genesis `[pouw]` model is the consensus PoW). Committed into the
+    /// genesis id via [`GenesisConfig::commitment`], so nodes with different
+    /// algorithms cannot silently share a chain.
+    #[serde(default = "default_pow_algorithm")]
+    pub algorithm: String,
+    /// Optional hard-fork height for a Blake3 → `algorithm` switch
+    /// (`HeightSwitchPow`). `None` runs `algorithm` from genesis.
+    #[serde(default)]
+    pub switch_height: Option<u64>,
+}
+
+fn default_pow_algorithm() -> String {
+    "blake3".to_string()
 }
 
 /// Coinbase emission schedule (Bitcoin-style halving for the MVP).
@@ -92,6 +106,17 @@ impl GenesisConfig {
         toml::to_string_pretty(self).map_err(|e| TaoError::Genesis(e.to_string()))
     }
 
+    /// The genesis **commitment**: a 32-byte hash over the entire canonical
+    /// (bincode) encoding of this config. Committed into the genesis block id,
+    /// so two nodes whose genesis files differ in *any* consensus parameter
+    /// (allocations, reward schedule, PoW algorithm, pouw model, …) derive
+    /// different genesis ids and refuse to share a chain — instead of silently
+    /// forking on the first state-root mismatch.
+    pub fn commitment(&self) -> [u8; 32] {
+        let bytes = bincode::serialize(self).expect("genesis config serializes");
+        *blake3::hash(&bytes).as_bytes()
+    }
+
     /// A built-in devnet genesis for local development.
     pub fn devnet() -> Self {
         Self {
@@ -103,6 +128,8 @@ impl GenesisConfig {
                 // Easy starting target (top byte zero) for CPU mining on a laptop.
                 initial_target: "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                     .to_string(),
+                algorithm: default_pow_algorithm(),
+                switch_height: None,
             },
             reward: RewardParams {
                 initial_lamports: 1_000_000_000, // 1 TAO (9 decimals, Solana-style)
@@ -127,6 +154,34 @@ impl GenesisConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commitment_is_sensitive_to_every_consensus_parameter() {
+        let base = GenesisConfig::devnet();
+        let c0 = base.commitment();
+        assert_eq!(c0, GenesisConfig::devnet().commitment(), "deterministic");
+
+        let mut g = base.clone();
+        g.allocations.push(Allocation {
+            address: "11111111111111111111111111111111".into(),
+            lamports: 1,
+        });
+        assert_ne!(g.commitment(), c0, "allocations are committed");
+
+        let mut g = base.clone();
+        g.reward.initial_lamports += 1;
+        assert_ne!(g.commitment(), c0, "reward schedule is committed");
+
+        let mut g = base.clone();
+        g.pow.algorithm = "pouw".into();
+        assert_ne!(g.commitment(), c0, "pow algorithm is committed");
+
+        let mut g = base.clone();
+        if let Some(p) = &mut g.pouw {
+            p.rank += 1;
+        }
+        assert_ne!(g.commitment(), c0, "pouw model params are committed");
+    }
 
     #[test]
     fn devnet_genesis_toml_round_trips_with_pouw() {

@@ -33,6 +33,15 @@ use tao_runtime::{Bank, BankError};
 
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Anti-DoS / consensus limits enforced on externally-received blocks.
+const MAX_PARENTS: usize = 16;
+const MAX_BLOCK_TXS: usize = 4096;
+const MAX_BLOCK_TX_BYTES: usize = 1 << 20; // 1 MiB of tx payload per block
+/// Maximum allowed clock drift: a block's timestamp may neither exceed local
+/// time by more (future-mined) nor regress below its selected parent by more
+/// (backdated). Bounds LWMA timestamp manipulation to a small factor.
+const MAX_TIMESTAMP_DRIFT_SECS: i64 = 600;
+
 /// Fixed env blockhash for SVM execution (does not affect state for plain transfers).
 fn env_blockhash() -> Blockhash {
     Blockhash::new_from_array([7u8; 32])
@@ -231,7 +240,9 @@ impl DagChain {
 
     /// Open (or create) a DAG chain with LWMA difficulty adjustment over the
     /// selected chain: `block_time_secs` is the desired seconds per block and
-    /// `lwma_window` is the averaging window (in blocks).
+    /// `lwma_window` is the averaging window (in blocks). The genesis carries no
+    /// config commitment (tests / throwaway local chains); production nodes use
+    /// [`Self::open_with_genesis`] so mismatched configs cannot share a chain.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_daa(
         data_dir: PathBuf,
@@ -243,13 +254,44 @@ impl DagChain {
         block_time_secs: u64,
         lwma_window: u64,
     ) -> Result<Self, String> {
-        // Deterministic genesis header (no parents, no txs).
+        Self::open_with_genesis(
+            data_dir,
+            k,
+            genesis_target,
+            miner,
+            reward,
+            allocations,
+            block_time_secs,
+            lwma_window,
+            [0u8; 32],
+        )
+    }
+
+    /// Like [`Self::open_with_daa`] but committing `genesis_commitment` (a hash
+    /// of the full genesis config) into the genesis header. Any consensus
+    /// parameter difference (allocations, reward, PoW algorithm, pouw model)
+    /// then yields a different genesis id — nodes with mismatched genesis files
+    /// reject each other's blocks instead of silently forking on state roots.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_genesis(
+        data_dir: PathBuf,
+        k: u16,
+        genesis_target: Target,
+        miner: Pubkey,
+        reward: u64,
+        allocations: Vec<(Pubkey, u64)>,
+        block_time_secs: u64,
+        lwma_window: u64,
+        genesis_commitment: [u8; 32],
+    ) -> Result<Self, String> {
+        // Deterministic genesis header (no parents, no txs). `state_root` holds
+        // the genesis config commitment (genesis has no executed state).
         let genesis_header = DagBlockHeader {
             version: HEADER_VERSION,
             parents: vec![],
             timestamp: 1_750_000_000,
             tx_merkle_root: Blockhash::default(),
-            state_root: Blockhash::default(),
+            state_root: Blockhash::new_from_array(genesis_commitment),
             target: genesis_target,
             interlink: Vec::new(),
             nonce: 0,
@@ -491,11 +533,21 @@ impl DagChain {
             })
             .collect();
         let target = self.next_target();
+        // Reference all tips, but respect the consensus parent cap (peers reject
+        // blocks with more). The heaviest tip must stay in (it is the selected
+        // parent the interlink and difficulty are derived from).
+        let mut parents = self.tips.clone();
+        if parents.len() > MAX_PARENTS {
+            let heaviest = self.engine.tip().to_bytes();
+            parents.retain(|p| *p != heaviest);
+            parents.truncate(MAX_PARENTS - 1);
+            parents.insert(0, heaviest);
+        }
         // Selected parent of a block referencing all tips is the heaviest tip.
         let interlink = self.interlink_for_parent(self.engine.tip().to_bytes());
         let mut header = DagBlockHeader {
             version: HEADER_VERSION,
-            parents: self.tips.clone(),
+            parents,
             timestamp,
             tx_merkle_root: tx_merkle_root(&serialized),
             state_root: Blockhash::default(),
@@ -532,15 +584,53 @@ impl DagChain {
         Ok(block)
     }
 
+    /// Context-free validity of an externally-received block: PoW, parent-list
+    /// shape, size limits, the PoW-committed tx merkle root (a header's PoW does
+    /// not cover transaction bytes directly, so without this check a relayer
+    /// could swap a valid header's transaction set), and a future-time bound.
+    /// Shared by [`Self::accept`] and snapshot suffix import.
+    fn validate_block_intrinsic(block: &DagBlock) -> Result<(), String> {
+        let h = &block.header;
+        if !meets_target(&h.id(), &h.target) {
+            return Err("invalid proof-of-work".into());
+        }
+        if h.parents.is_empty() {
+            return Err("non-genesis block without parents".into());
+        }
+        if h.parents.len() > MAX_PARENTS {
+            return Err(format!("too many parents: {} > {MAX_PARENTS}", h.parents.len()));
+        }
+        let mut uniq = HashSet::new();
+        if !h.parents.iter().all(|p| uniq.insert(*p)) {
+            return Err("duplicate parent".into());
+        }
+        if block.transactions.len() > MAX_BLOCK_TXS {
+            return Err(format!(
+                "too many transactions: {} > {MAX_BLOCK_TXS}",
+                block.transactions.len()
+            ));
+        }
+        let tx_bytes: usize = block.transactions.iter().map(|t| t.len()).sum();
+        if tx_bytes > MAX_BLOCK_TX_BYTES {
+            return Err(format!("block too large: {tx_bytes} > {MAX_BLOCK_TX_BYTES} tx bytes"));
+        }
+        if tx_merkle_root(&block.transactions) != h.tx_merkle_root {
+            return Err("tx merkle root mismatch (transaction set not the PoW-committed one)".into());
+        }
+        if h.timestamp > Self::now().saturating_add(MAX_TIMESTAMP_DRIFT_SECS) {
+            return Err("timestamp too far in the future".into());
+        }
+        Ok(())
+    }
+
     /// Accept an externally-produced block (e.g. from a peer): validate PoW,
-    /// persist, and apply.
+    /// transaction commitment, timestamps, difficulty, and interlink; persist;
+    /// apply.
     pub fn accept(&mut self, block: DagBlock) -> Result<(), String> {
         if self.blocks.contains(&block.id()) {
             return Ok(()); // already have it (gossip duplicate)
         }
-        if !meets_target(&block.header.id(), &block.header.target) {
-            return Err("invalid proof-of-work".into());
-        }
+        Self::validate_block_intrinsic(&block)?;
         if !block.header.parents.iter().all(|p| self.blocks.contains(p)) {
             let missing_pruned_parent = block.header.parents.iter().any(|p| {
                 *p != self.genesis_dag.to_bytes() && self.history_pruned && !self.blocks.contains(p)
@@ -556,6 +646,14 @@ impl DagChain {
         let expected = self.selected_chain_target(sp);
         if block.header.target != expected {
             return Err("unexpected difficulty target".into());
+        }
+        // Timestamps may not regress below the selected parent by more than the
+        // allowed drift (with the future bound above, this caps how far the LWMA
+        // solvetimes can be skewed in either direction).
+        if let Some(sp_header) = self.headers.get(&sp.to_bytes()) {
+            if block.header.timestamp < sp_header.timestamp - MAX_TIMESTAMP_DRIFT_SECS {
+                return Err("timestamp regresses below selected parent".into());
+            }
         }
         // The interlink must be correctly derived from the selected parent (it is
         // PoW-committed, so a valid one proves the miner built it honestly).
@@ -661,7 +759,10 @@ impl DagChain {
     }
 
     /// Execute the given block ids (in order) through `bank`: each non-genesis
-    /// block credits the coinbase then runs its transactions.
+    /// block credits the coinbase **to the miner committed in its header** then
+    /// runs its transactions. (Paying the local miner here would diverge state
+    /// across nodes the moment two miners with different reward addresses
+    /// exchange blocks.)
     fn replay_blocks(&self, bank: &Bank, blocks: &[[u8; 32]]) -> Result<(), BankError> {
         let genesis = self.genesis_dag.to_bytes();
         let bh = env_blockhash();
@@ -670,7 +771,12 @@ impl DagChain {
                 continue;
             }
             if self.reward > 0 {
-                bank.airdrop(&self.miner, self.reward)?;
+                let beneficiary = self
+                    .headers
+                    .get(block)
+                    .map(|h| h.miner)
+                    .ok_or_else(|| BankError::Storage("missing header for coinbase".into()))?;
+                bank.airdrop(&beneficiary, self.reward)?;
             }
             if let Some(txs) = self.block_txs.get(block) {
                 for tx in txs {
@@ -927,13 +1033,22 @@ impl DagChain {
             return Ok(false);
         }
 
+        // Validate the suffix *before* adopting anything: each block must carry
+        // real PoW and its PoW-committed transaction set (a snapshot peer cannot
+        // smuggle forged transactions under valid headers). Full DAA/interlink
+        // re-validation is impossible without the pruned history below the
+        // origin; the proof's most-work comparison covers that part.
+        for block in &snap.suffix {
+            Self::validate_block_intrinsic(block)?;
+        }
+
         self.load_snapshot(
             snap.origin_header.clone(),
             snap.accounts.clone(),
             snap.proof.clone(),
         );
         for block in &snap.suffix {
-            self.apply(block)?; // trusted: no PoW / difficulty re-validation
+            self.apply(block)?;
         }
         // Persist a compacted log so a restart reproduces the synced chain.
         let mut records: Vec<Vec<u8>> = Vec::with_capacity(1 + snap.suffix.len());
@@ -1371,17 +1486,21 @@ mod tests {
 
     #[test]
     fn two_miners_converge() {
-        // Two independent miners produce blocks; after exchanging them, both
-        // nodes must reach the SAME GHOSTDAG order and the SAME state — the
-        // property that makes a multi-miner blockDAG sound.
+        // Two independent miners with DIFFERENT reward addresses produce blocks;
+        // after exchanging them, both nodes must reach the SAME GHOSTDAG order
+        // and the SAME state — the property that makes a multi-miner blockDAG
+        // sound. (Coinbase must pay the header's miner, not the local config.)
         let payer = solana_keypair::Keypair::new();
         let a = solana_keypair::Keypair::new();
         let b = solana_keypair::Keypair::new();
-        let miner = Pubkey::new_unique();
+        let miner1 = Pubkey::new_unique();
+        let miner2 = Pubkey::new_unique();
         let allocs = vec![(payer.pubkey(), 1_000_000_000)];
 
-        let mut c1 = DagChain::open(dir("c1"), 3, easy_target(), miner, 0, allocs.clone()).unwrap();
-        let mut c2 = DagChain::open(dir("c2"), 3, easy_target(), miner, 0, allocs.clone()).unwrap();
+        let mut c1 =
+            DagChain::open(dir("c1"), 3, easy_target(), miner1, 1_000, allocs.clone()).unwrap();
+        let mut c2 =
+            DagChain::open(dir("c2"), 3, easy_target(), miner2, 1_000, allocs.clone()).unwrap();
 
         // Miner 1 builds a two-block chain; miner 2 builds a parallel block.
         let b1 = c1
@@ -1399,15 +1518,95 @@ mod tests {
         c2.accept(b2).unwrap();
         c1.accept(b3).unwrap();
 
-        // Both nodes now hold the same block set → identical order and state.
+        // Both nodes now hold the same block set → identical order.
         assert_eq!(
             c1.total_order(),
             c2.total_order(),
             "miners converge on one order"
         );
-        let r1 = c1.rebuild_state().unwrap().state_root().unwrap();
-        let r2 = c2.rebuild_state().unwrap().state_root().unwrap();
-        assert_eq!(r1, r2, "miners converge on one state");
+        // b3 is an unmerged parallel tip (not yet in the total order). Mine a
+        // merge block on c1 referencing both tips and gossip it: every block —
+        // including b3 — is now ordered, and each coinbase went to the miner
+        // committed in its block header on BOTH nodes.
+        let b4 = c1.mine(&[]).unwrap();
+        c2.accept(b4).unwrap();
+        assert_eq!(c1.total_order(), c2.total_order());
+        let bank1 = c1.rebuild_state().unwrap();
+        let bank2 = c2.rebuild_state().unwrap();
+        assert_eq!(
+            bank1.state_root().unwrap(),
+            bank2.state_root().unwrap(),
+            "miners converge on one state"
+        );
+        assert_eq!(bank2.balance(&miner1), 3_000, "miner1 mined b1, b2 and the merge");
+        assert_eq!(bank2.balance(&miner2), 1_000, "miner2's coinbase paid on both nodes");
+    }
+
+    #[test]
+    fn rejects_swapped_transaction_set() {
+        // The header's PoW commits the tx merkle root; a relayer must not be
+        // able to replace the transaction set under a valid header.
+        let payer = solana_keypair::Keypair::new();
+        let allocs = vec![(payer.pubkey(), 1_000_000_000)];
+        let miner = Pubkey::new_unique();
+        let mut chain =
+            DagChain::open(dir("txswap"), 3, easy_target(), miner, 0, allocs.clone()).unwrap();
+        let side =
+            DagChain::open(dir("txswap-side"), 3, easy_target(), miner, 0, allocs).unwrap();
+        let mut block = side.build_block(&[transfer(&payer, &Pubkey::new_unique(), 1_000)]);
+        // Swap in a different transaction without re-committing the root.
+        block.transactions =
+            vec![bincode::serialize(&transfer(&payer, &Pubkey::new_unique(), 999_000_000)).unwrap()];
+        let err = chain.accept(block).unwrap_err();
+        assert!(err.contains("merkle"), "expected merkle rejection, got: {err}");
+    }
+
+    #[test]
+    fn rejects_future_timestamp() {
+        let miner = Pubkey::new_unique();
+        let mut chain = DagChain::open(dir("future-ts"), 3, easy_target(), miner, 0, vec![]).unwrap();
+        let side = DagChain::open(dir("future-ts-side"), 3, easy_target(), miner, 0, vec![]).unwrap();
+        let block = side.build_block_at(&[], DagChain::now() + MAX_TIMESTAMP_DRIFT_SECS + 60);
+        let err = chain.accept(block).unwrap_err();
+        assert!(err.contains("future"), "expected future-time rejection, got: {err}");
+    }
+
+    #[test]
+    fn rejects_too_many_parents_and_duplicates() {
+        let miner = Pubkey::new_unique();
+        let mut chain = DagChain::open(dir("parents"), 3, easy_target(), miner, 0, vec![]).unwrap();
+        let side = DagChain::open(dir("parents-side"), 3, easy_target(), miner, 0, vec![]).unwrap();
+
+        let mut dup = side.build_block(&[]);
+        let p = dup.header.parents[0];
+        dup.header.parents.push(p);
+        while !meets_target(&dup.header.id(), &dup.header.target) {
+            dup.header.nonce = dup.header.nonce.wrapping_add(1);
+        }
+        assert!(chain.accept(dup).unwrap_err().contains("duplicate parent"));
+
+        let mut many = side.build_block(&[]);
+        many.header.parents = (0..MAX_PARENTS as u8 + 1).map(|i| [i; 32]).collect();
+        while !meets_target(&many.header.id(), &many.header.target) {
+            many.header.nonce = many.header.nonce.wrapping_add(1);
+        }
+        assert!(chain.accept(many).unwrap_err().contains("too many parents"));
+    }
+
+    #[test]
+    fn genesis_commitment_changes_genesis_id() {
+        // Two nodes whose genesis configs differ derive different genesis ids,
+        // so they cannot silently share a chain.
+        let miner = Pubkey::new_unique();
+        let a = DagChain::open_with_genesis(
+            dir("gc-a"), 3, easy_target(), miner, 0, vec![], 10, u64::MAX, [1u8; 32],
+        )
+        .unwrap();
+        let b = DagChain::open_with_genesis(
+            dir("gc-b"), 3, easy_target(), miner, 0, vec![], 10, u64::MAX, [2u8; 32],
+        )
+        .unwrap();
+        assert_ne!(a.total_order()[0], b.total_order()[0]);
     }
 
     #[test]
@@ -1538,10 +1737,11 @@ mod tests {
         // Build a sibling of a recent (post-checkpoint) block → reorders the tail.
         let parent = mined[mined.len() - 3].id();
         let target = chain.expected_target(&[parent]);
+        let parent_ts = chain.headers.get(&parent).unwrap().timestamp;
         let mut h = DagBlockHeader {
             version: HEADER_VERSION,
             parents: vec![parent],
-            timestamp: 9_000_000,
+            timestamp: parent_ts,
             tx_merkle_root: tx_merkle_root(&[]),
             state_root: Blockhash::default(),
             target,

@@ -20,7 +20,10 @@ pub fn parse_target(hex_str: &str) -> Result<Target, String> {
 /// Construct the deterministic genesis header for a network.
 ///
 /// Genesis carries no PoW (its nonce is fixed at 0); all nodes derive the same
-/// genesis id from the same [`GenesisConfig`].
+/// genesis id from the same [`GenesisConfig`]. The full config is committed via
+/// its hash in `state_root`, so configs differing in any consensus parameter
+/// (allocations, reward, PoW algorithm, …) yield different genesis ids — nodes
+/// with mismatched genesis files cannot silently share a chain.
 pub fn genesis_header(cfg: &GenesisConfig) -> Result<BlockHeader, String> {
     let target = parse_target(&cfg.pow.initial_target)?;
     Ok(BlockHeader {
@@ -29,7 +32,7 @@ pub fn genesis_header(cfg: &GenesisConfig) -> Result<BlockHeader, String> {
         height: 0,
         timestamp: cfg.creation_time,
         tx_merkle_root: Hash::default(),
-        state_root: Hash::default(),
+        state_root: Hash::new_from_array(cfg.commitment()),
         target,
         nonce: 0,
         miner: Pubkey::default(),
@@ -47,6 +50,18 @@ mod tests {
         let b = genesis_header(&cfg).unwrap();
         assert_eq!(a.id(), b.id());
         assert!(a.is_genesis());
+    }
+
+    #[test]
+    fn genesis_id_commits_to_the_config() {
+        let base = GenesisConfig::devnet();
+        let mut tampered = base.clone();
+        tampered.reward.initial_lamports += 1;
+        assert_ne!(
+            genesis_header(&base).unwrap().id(),
+            genesis_header(&tampered).unwrap().id(),
+            "a consensus-parameter change must change the genesis id"
+        );
     }
 
     #[test]
