@@ -50,6 +50,43 @@ enum LogRecord {
     },
 }
 
+/// Legacy M8-raw `DagBlockHeader` format (pre `state_root` + `interlink`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyDagBlockHeader {
+    /// Header format version.
+    version: u32,
+    /// Parent block ids (the GHOSTDAG parents). Empty only for genesis.
+    parents: Vec<[u8; 32]>,
+    /// Block timestamp (unix seconds).
+    timestamp: i64,
+    /// Merkle root over the block's transactions.
+    tx_merkle_root: Blockhash,
+    /// PoW target threshold (big-endian). `pow_hash <= target` wins.
+    target: Target,
+    /// PoW solution nonce.
+    nonce: u64,
+    /// Address that receives this block's coinbase reward.
+    miner: Pubkey,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyDagBlock {
+    header: LegacyDagBlockHeader,
+    transactions: Vec<Vec<u8>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum LegacyLogRecord {
+    /// Old payload variant before the state-root/interlink migration.
+    Block(LegacyDagBlock),
+}
+
+fn legacy_block_id(header: &LegacyDagBlockHeader) -> Result<[u8; 32], String> {
+    bincode::serialize(header)
+        .map(|bytes| *blake3::hash(&bytes).as_bytes())
+        .map_err(|e| e.to_string())
+}
+
 /// Bootstrap payload a pruned node ships to a fresh/behind peer: the pruning
 /// point (origin header + its account-set snapshot) plus the kept suffix blocks.
 ///
@@ -83,22 +120,28 @@ fn verify_proof(
     if proof.last().unwrap().id() != origin {
         return Err("proof does not end at the claimed origin".into());
     }
-    let mut work = primitive_types::U256::zero();
-    for (i, h) in proof.iter().enumerate() {
-        // proof[0] is the genesis anchor (a known constant, nonce 0, not mined);
-        // it is verified by id equality above, not by PoW.
-        if i > 0 && !meets_target(&h.id(), &h.target) {
+    // The proof is genesis-first (topologically ordered). Each non-genesis header
+    // must carry valid PoW and point back — via an interlink entry or a parent —
+    // to a header already seen, so the whole set is connected to genesis. This
+    // tolerates the multi-level structure (consecutive proof headers need not be
+    // adjacent in the DAG). Work is the sum over the sampled headers.
+    let mut present: HashSet<[u8; 32]> = HashSet::new();
+    present.insert(proof[0].id());
+    let mut work = tao_consensus::work_for_target(&proof[0].target);
+    for h in proof.iter().skip(1) {
+        if !meets_target(&h.id(), &h.target) {
             return Err("invalid proof-of-work in proof".into());
         }
-        work = work.saturating_add(tao_consensus::work_for_target(&h.target));
-        if i + 1 < proof.len() {
-            // The newer header must point back to this one (interlink or parent).
-            let newer = &proof[i + 1];
-            let older = h.id();
-            if !newer.interlink.contains(&older) && !newer.parents.contains(&older) {
-                return Err("proof not interlink-connected".into());
-            }
+        let connected = h
+            .interlink
+            .iter()
+            .chain(h.parents.iter())
+            .any(|p| present.contains(p));
+        if !connected {
+            return Err("proof not interlink-connected".into());
         }
+        work = work.saturating_add(tao_consensus::work_for_target(&h.target));
+        present.insert(h.id());
     }
     Ok(work)
 }
@@ -158,6 +201,10 @@ struct Checkpoint {
 /// Blocks kept beyond the checkpoint before it advances (finality margin).
 const DEFAULT_FINALITY_DEPTH: u64 = 100;
 
+/// NiPoPoW security parameter: how many blocks per level the proof retains before
+/// advancing the anchor (more = harder to forge, larger proof).
+const PROOF_SECURITY_M: usize = 10;
+
 impl DagChain {
     /// Open (or create) a DAG chain under `data_dir` with **fixed** difficulty.
     /// The block log is replayed.
@@ -170,7 +217,16 @@ impl DagChain {
         allocations: Vec<(Pubkey, u64)>,
     ) -> Result<Self, String> {
         // window = u64::MAX ⇒ next_target is always in "warmup" ⇒ fixed target.
-        Self::open_with_daa(data_dir, k, target, miner, reward, allocations, 10, u64::MAX)
+        Self::open_with_daa(
+            data_dir,
+            k,
+            target,
+            miner,
+            reward,
+            allocations,
+            10,
+            u64::MAX,
+        )
     }
 
     /// Open (or create) a DAG chain with LWMA difficulty adjustment over the
@@ -238,11 +294,44 @@ impl DagChain {
         // then block records are applied on top.
         let records = chain.log.read_all().map_err(|e| e.to_string())?;
         for bytes in records {
-            match bincode::deserialize::<LogRecord>(&bytes).map_err(|e| e.to_string())? {
-                LogRecord::Snapshot { origin_header, accounts, proof } => {
-                    chain.load_snapshot(origin_header, accounts, proof);
+            match bincode::deserialize::<LogRecord>(&bytes).map_err(|e| e.to_string()) {
+                Ok(record) => match record {
+                    LogRecord::Snapshot {
+                        origin_header,
+                        accounts,
+                        proof,
+                    } => {
+                        chain.load_snapshot(origin_header, accounts, proof);
+                    }
+                    LogRecord::Block(block) => chain.apply(&block)?,
+                },
+                Err(primary_err) => {
+                    if let Ok(LegacyLogRecord::Block(block)) =
+                        bincode::deserialize::<LegacyLogRecord>(&bytes)
+                    {
+                        let block_id = legacy_block_id(&block.header)?;
+                        let header = DagBlockHeader {
+                            version: block.header.version,
+                            parents: block.header.parents,
+                            timestamp: block.header.timestamp,
+                            tx_merkle_root: block.header.tx_merkle_root,
+                            state_root: Blockhash::default(),
+                            target: block.header.target,
+                            interlink: Vec::new(),
+                            nonce: block.header.nonce,
+                            miner: block.header.miner,
+                        };
+                        chain.apply_with_id(
+                            DagBlock {
+                                header,
+                                transactions: block.transactions,
+                            },
+                            block_id,
+                        )?;
+                    } else {
+                        return Err(primary_err);
+                    }
                 }
-                LogRecord::Block(block) => chain.apply(&block)?,
             }
         }
         Ok(chain)
@@ -278,34 +367,89 @@ impl DagChain {
             .unwrap_or(self.genesis_dag)
     }
 
-    /// Build a succinct NiPoPoW proof for `p`: walk the highest-level interlink
-    /// back-pointer at each step from `p` until genesis (empty interlink). Each
-    /// jump is the longest available, so the proof is logarithmic-ish in the work
-    /// while staying interlink-connected and anchored at genesis. Must be called
-    /// while `p`'s ancestor headers still exist (before they are pruned).
+    /// Build a succinct NiPoPoW proof for `p` (the NiPoPoW "Prove" shape): process
+    /// levels high→low; at each level collect the level-≥μ chain from `p` back to a
+    /// moving anchor, then advance the anchor `m` blocks toward `p` so lower levels
+    /// only densify the recent part. The result covers deep history with rare
+    /// high-level blocks and recent history densely — `O(m·log(work))` headers,
+    /// interlink-connected and anchored at genesis. Must run before `p`'s ancestors
+    /// are pruned.
     fn build_proof_for(&self, p: [u8; 32]) -> Vec<DagBlockHeader> {
-        let mut proof = Vec::new();
-        let mut cur = p;
-        let mut guard = 0usize;
-        loop {
-            let h = match self.headers.get(&cur) {
-                Some(h) => h.clone(),
-                None => break, // ancestor already pruned — proof can't reach genesis
-            };
-            let interlink = h.interlink.clone();
-            proof.push(h);
-            match interlink.last() {
-                None => break,                  // genesis (empty interlink)
-                Some(&next) if next == cur => break,
-                Some(&next) => cur = next,      // jump to the highest-level ancestor
+        let genesis = self.genesis_dag.to_bytes();
+        let p_header = match self.headers.get(&p) {
+            Some(h) => h.clone(),
+            None => return Vec::new(),
+        };
+        let max_level = p_header.interlink.len();
+        let mut included: HashSet<[u8; 32]> = HashSet::new();
+        let mut collected: Vec<DagBlockHeader> = Vec::new();
+        let mut anchor = genesis;
+        for mu in (0..max_level).rev() {
+            let seg = self.level_segment(p, mu, anchor, genesis);
+            for h in &seg {
+                if included.insert(h.id()) {
+                    collected.push(h.clone());
+                }
             }
-            guard += 1;
-            if guard > 1_000_000 {
+            if seg.len() > PROOF_SECURITY_M {
+                anchor = seg[PROOF_SECURITY_M].id(); // m blocks back from p
+            }
+            if anchor == p {
                 break;
             }
         }
-        proof.reverse(); // genesis-first
-        proof
+        // Always include the genesis anchor.
+        if let Some(g) = self.headers.get(&genesis) {
+            if included.insert(genesis) {
+                collected.push(g.clone());
+            }
+        }
+        // Topological (genesis-first) order via blue score (available pre-prune).
+        collected.sort_by_key(|h| self.engine.blue_score(DagHash::from_bytes(h.id())));
+        collected
+    }
+
+    /// The level-≥`mu` chain from `p` back to (and including) `anchor`, following
+    /// `interlink[mu]`. `p`-first. Stops once it passes `anchor`.
+    fn level_segment(
+        &self,
+        p: [u8; 32],
+        mu: usize,
+        anchor: [u8; 32],
+        genesis: [u8; 32],
+    ) -> Vec<DagBlockHeader> {
+        let mut out = Vec::new();
+        let mut cur = p;
+        // Interlink ancestors lie on the selected chain, so blue score is
+        // monotonic along the walk — compare it (a cheap map lookup) instead of a
+        // reachability query to decide when we've reached the anchor.
+        let anchor_score = self.engine.blue_score(DagHash::from_bytes(anchor));
+        loop {
+            // Include `cur` only while it is at or after the anchor.
+            let after_anchor = cur == anchor
+                || anchor == genesis
+                || self.engine.blue_score(DagHash::from_bytes(cur)) >= anchor_score;
+            if !after_anchor {
+                break;
+            }
+            let h = match self.headers.get(&cur) {
+                Some(h) => h.clone(),
+                None => break,
+            };
+            out.push(h.clone());
+            if cur == anchor {
+                break;
+            }
+            if mu >= h.interlink.len() {
+                break; // no level-≥mu ancestor (reached the bottom of this level)
+            }
+            let next = h.interlink[mu];
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+        out
     }
 
     /// The NiPoPoW interlink a block built on selected parent `sp` must commit to:
@@ -362,7 +506,10 @@ impl DagChain {
     }
 
     fn now() -> i64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     }
 
     /// Build a PoW block referencing the current tips with the given transactions.
@@ -373,8 +520,15 @@ impl DagChain {
     /// Like [`Self::build_block`] but with an explicit header timestamp (used to
     /// test the DAA deterministically without relying on wall-clock spacing).
     pub fn build_block_at(&self, transactions: &[Transaction], timestamp: i64) -> DagBlock {
-        let serialized: Vec<Vec<u8>> =
-            transactions.iter().map(|t| bincode::serialize(t).expect("tx serialize")).collect();
+        let serialized: Vec<Vec<u8>> = transactions
+            .iter()
+            .map(|t| {
+                bincode::serialize(t).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "serialize tx for block build failed; using empty tx encoding");
+                    Vec::new()
+                })
+            })
+            .collect();
         let target = self.next_target();
         // Selected parent of a block referencing all tips is the heaviest tip.
         let interlink = self.interlink_for_parent(self.engine.tip().to_bytes());
@@ -392,7 +546,10 @@ impl DagChain {
         while !meets_target(&header.id(), &target) {
             header.nonce = header.nonce.wrapping_add(1);
         }
-        DagBlock { header, transactions: serialized }
+        DagBlock {
+            header,
+            transactions: serialized,
+        }
     }
 
     /// Mine a block (build + persist + apply).
@@ -401,9 +558,14 @@ impl DagChain {
     }
 
     /// Mine a block with an explicit header timestamp.
-    pub fn mine_at(&mut self, transactions: &[Transaction], timestamp: i64) -> Result<DagBlock, String> {
+    pub fn mine_at(
+        &mut self,
+        transactions: &[Transaction],
+        timestamp: i64,
+    ) -> Result<DagBlock, String> {
         let block = self.build_block_at(transactions, timestamp);
-        let rec = bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?;
+        let rec =
+            bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?;
         self.log.append(&rec).map_err(|e| e.to_string())?;
         self.apply(&block)?;
         Ok(block)
@@ -419,6 +581,12 @@ impl DagChain {
             return Err("invalid proof-of-work".into());
         }
         if !block.header.parents.iter().all(|p| self.blocks.contains(p)) {
+            let missing_pruned_parent = block.header.parents.iter().any(|p| {
+                *p != self.genesis_dag.to_bytes() && self.history_pruned && !self.blocks.contains(p)
+            });
+            if missing_pruned_parent {
+                return Err("parent pruned".into());
+            }
             return Err("unknown parent (orphan)".into());
         }
         // Consensus-enforced difficulty: the block must declare exactly the
@@ -433,14 +601,14 @@ impl DagChain {
         if block.header.interlink != self.interlink_for_parent(sp.to_bytes()) {
             return Err("invalid interlink".into());
         }
-        let rec = bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?;
+        let rec =
+            bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?;
         self.log.append(&rec).map_err(|e| e.to_string())?;
         self.apply(&block)
     }
 
     /// Add a block to the in-memory DAG + GHOSTDAG (no persistence).
-    fn apply(&mut self, block: &DagBlock) -> Result<(), String> {
-        let id = block.id();
+    fn apply_with_id(&mut self, block: DagBlock, id: [u8; 32]) -> Result<(), String> {
         if self.blocks.contains(&id) {
             return Ok(());
         }
@@ -481,9 +649,18 @@ impl DagChain {
         Ok(())
     }
 
+    /// Add a block using its intrinsic id (used when loading legacy log records).
+    fn apply(&mut self, block: &DagBlock) -> Result<(), String> {
+        self.apply_with_id(block.clone(), block.id())
+    }
+
     /// The GHOSTDAG total order (block ids), genesis first.
     pub fn total_order(&self) -> Vec<[u8; 32]> {
-        self.engine.total_order().into_iter().map(|h| h.to_bytes()).collect()
+        self.engine
+            .total_order()
+            .into_iter()
+            .map(|h| h.to_bytes())
+            .collect()
     }
 
     /// Set the finality depth (blocks kept beyond the checkpoint). `0` disables
@@ -496,12 +673,15 @@ impl DagChain {
     /// it is seeded with the genesis allocations (state before any block); when
     /// false it starts empty (used for restoring a checkpoint snapshot).
     fn open_bank(&self, dir: &Path, seed_genesis: bool) -> Result<Bank, BankError> {
-        let _ = std::fs::remove_dir_all(dir);
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|e| BankError::Storage(e.to_string()))?;
+        }
         let db = Arc::new(AccountsDb::open(dir).map_err(|e| BankError::Storage(e.to_string()))?);
         if seed_genesis {
             if let Some(base) = &self.base_accounts {
                 // Post-prune: the genesis state is the re-anchor snapshot.
-                db.commit(base.iter().cloned()).map_err(|e| BankError::Storage(e.to_string()))?;
+                db.commit(base.iter().cloned())
+                    .map_err(|e| BankError::Storage(e.to_string()))?;
             } else {
                 let system = solana_sdk_ids::system_program::id();
                 for (pubkey, lamports) in &self.allocations {
@@ -579,7 +759,9 @@ impl DagChain {
             // If a finalized checkpoint still matches the new order, rebuild from
             // it (replay only the post-checkpoint suffix) instead of from genesis.
             let from_checkpoint = match &self.checkpoint {
-                Some(cp) if order.len() >= cp.len && order[cp.len - 1] == cp.last_id => Some(cp.len),
+                Some(cp) if order.len() >= cp.len && order[cp.len - 1] == cp.last_id => {
+                    Some(cp.len)
+                }
                 _ => None,
             };
             let bank = if let Some(cp_len) = from_checkpoint {
@@ -635,9 +817,16 @@ impl DagChain {
         } else {
             self.replay_blocks(&bank, &self.executed[..target])?;
         }
-        let accounts = bank.accounts().dump().map_err(|e| BankError::Storage(e.to_string()))?;
+        let accounts = bank
+            .accounts()
+            .dump()
+            .map_err(|e| BankError::Storage(e.to_string()))?;
         let last_id = self.executed[target - 1];
-        self.checkpoint = Some(Checkpoint { len: target, last_id, accounts });
+        self.checkpoint = Some(Checkpoint {
+            len: target,
+            last_id,
+            accounts,
+        });
         Ok(())
     }
 
@@ -673,9 +862,18 @@ impl DagChain {
     /// cost. Returns how many blocks' transactions were dropped.
     ///
     /// This is consensus-safe: it touches no ordering, difficulty, or GHOSTDAG
-    /// computation — only data already reflected in the snapshot. After it,
-    /// state is queryable solely via [`Self::virtual_state`] (which rebuilds from
-    /// the checkpoint); [`Self::rebuild_state`] (full replay from genesis) errors.
+    /// computation — only data already reflected in the snapshot.
+    /// The effect is process-local and not durable by itself:
+    /// it does not compact `dag.log`, so after restart the same checkpoint prefix
+    /// (including transaction bodies) is replayed from disk.
+    ///
+    /// After a restart, this method’s memory reduction is therefore temporary unless
+    /// followed by [`Self::prune`], which rewrites logs and headers for durable
+    /// history drop.
+    ///
+    /// After `prune_finalized_transactions`, state is queryable solely via
+    /// [`Self::virtual_state`] (which rebuilds from the checkpoint); [`Self::rebuild_state`]
+    /// (full replay from genesis) returns an error.
     ///
     /// NOTE: headers and the GHOSTDAG engine are retained (DAA samples the
     /// selected chain over them, and pruning them would change the difficulty
@@ -720,7 +918,11 @@ impl DagChain {
         let origin_header = self.headers.get(&origin)?.clone();
         let accounts = self.base_accounts.clone()?;
         let order = self.total_order();
-        let suffix: Vec<DagBlock> = order.iter().skip(1).filter_map(|id| self.get_block(id)).collect();
+        let suffix: Vec<DagBlock> = order
+            .iter()
+            .skip(1)
+            .filter_map(|id| self.get_block(id))
+            .collect();
         bincode::serialize(&SyncSnapshot {
             origin_header,
             accounts,
@@ -744,7 +946,11 @@ impl DagChain {
         // across competing peers is the node's job; here we verify validity.)
         let _work = verify_proof(&snap.proof, origin, self.genesis_dag.to_bytes())?;
 
-        self.load_snapshot(snap.origin_header.clone(), snap.accounts.clone(), snap.proof.clone());
+        self.load_snapshot(
+            snap.origin_header.clone(),
+            snap.accounts.clone(),
+            snap.proof.clone(),
+        );
         for block in &snap.suffix {
             self.apply(block)?; // trusted: no PoW / difficulty re-validation
         }
@@ -759,7 +965,9 @@ impl DagChain {
             .map_err(|e| e.to_string())?,
         );
         for block in &snap.suffix {
-            records.push(bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?);
+            records.push(
+                bincode::serialize(&LogRecord::Block(block.clone())).map_err(|e| e.to_string())?,
+            );
         }
         self.log.replace_all(&records).map_err(|e| e.to_string())?;
         Ok(true)
@@ -776,7 +984,7 @@ impl DagChain {
         // Retain at least an LWMA window + finality margin behind the tip so that
         // every new block's difficulty window stays within retained blocks (no
         // divergence from non-pruned peers).
-        let retain = (self.lwma_window.saturating_add(self.finality_depth)) as usize;
+        let retain = (self.lwma_window.saturating_add(self.finality_depth.max(1))) as usize;
         if n <= retain.saturating_add(1) {
             return Ok(0);
         }
@@ -796,7 +1004,10 @@ impl DagChain {
             }
         }
         // Deepest selected-chain block at index ≤ cutoff (and past the origin).
-        let p_idx = match (1..=cutoff.min(n - 1)).rev().find(|&i| on_selected_chain.contains(&order[i])) {
+        let p_idx = match (1..=cutoff.min(n - 1))
+            .rev()
+            .find(|&i| on_selected_chain.contains(&order[i]))
+        {
             Some(i) => i,
             None => return Ok(0),
         };
@@ -808,10 +1019,42 @@ impl DagChain {
         let new_proof = self.build_proof_for(p);
 
         // Base state = account set after executing the pruned prefix (order[..=p_idx]).
-        // Built from the current base/genesis, replaying only up to P (bounded).
-        let base_bank = self.open_bank(&self.checkpoint_dir, true)?;
-        self.replay_blocks(&base_bank, &order[..=p_idx])?; // order[0] == current origin, skipped
-        let new_base = base_bank.accounts().dump().map_err(|e| BankError::Storage(e.to_string()))?;
+        // Normally this is seeded from genesis; after finalized-tx pruning it must be
+        // rebuilt from the checkpoint prefix that still contains the authoritative
+        // tx effects.
+        let base_bank = self.open_bank(
+            &self.checkpoint_dir,
+            self.base_accounts.is_none() && !self.history_pruned,
+        )?;
+        if self.history_pruned && self.base_accounts.is_none() {
+            let cp = self.checkpoint.as_ref().ok_or_else(|| {
+                BankError::Storage("history pruned; no checkpoint available".into())
+            })?;
+            if cp.len > p_idx + 1 {
+                return Err(BankError::Storage(
+                    "prune point is before checkpoint".into(),
+                ));
+            }
+            base_bank
+                .accounts()
+                .commit(cp.accounts.iter().cloned())
+                .map_err(|e| BankError::Storage(e.to_string()))?;
+            if cp.len <= p_idx {
+                self.replay_blocks(&base_bank, &order[cp.len..=p_idx])?;
+            }
+        } else if let Some(base) = &self.base_accounts {
+            base_bank
+                .accounts()
+                .commit(base.iter().cloned())
+                .map_err(|e| BankError::Storage(e.to_string()))?;
+            self.replay_blocks(&base_bank, &order[..=p_idx])?;
+        } else {
+            self.replay_blocks(&base_bank, &order[..=p_idx])?;
+        }
+        let new_base = base_bank
+            .accounts()
+            .dump()
+            .map_err(|e| BankError::Storage(e.to_string()))?;
 
         // Rebuild the engine with P as genesis; re-add the kept suffix.
         let kept: HashSet<[u8; 32]> = order[p_idx..].iter().copied().collect();
@@ -822,7 +1065,13 @@ impl DagChain {
             let mut parents: Vec<DagHash> = header
                 .parents
                 .iter()
-                .map(|pp| if kept.contains(pp) { DagHash::from_bytes(*pp) } else { p_dag })
+                .map(|pp| {
+                    if kept.contains(pp) {
+                        DagHash::from_bytes(*pp)
+                    } else {
+                        p_dag
+                    }
+                })
                 .collect();
             parents.sort_by(|a, b| a.to_bytes().cmp(&b.to_bytes()));
             parents.dedup();
@@ -831,29 +1080,35 @@ impl DagChain {
 
         let pruned_count = self.blocks.len().saturating_sub(kept.len());
 
-        // Swap in the re-anchored state.
-        self.engine = engine;
-        self.genesis_dag = p_dag;
-        self.base_accounts = Some(new_base);
-        self.history_pruned = true;
-        self.checkpoint = None;
-        self.headers.retain(|id, _| kept.contains(id));
-        self.block_txs.retain(|id, _| kept.contains(id) && *id != p);
-        self.blocks = kept;
-        self.proof = new_proof;
-        self.state = None;
-        self.executed.clear();
+        let new_headers: HashMap<[u8; 32], DagBlockHeader> = kept
+            .iter()
+            .filter_map(|id| self.headers.get(id).cloned().map(|h| (*id, h)))
+            .collect();
+        let new_block_txs: HashMap<[u8; 32], Vec<Transaction>> = self
+            .block_txs
+            .iter()
+            .filter_map(|(id, txs)| {
+                if kept.contains(id) {
+                    Some((*id, txs.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let p_header = new_headers
+            .get(&p)
+            .cloned()
+            .expect("origin header retained");
 
         // Compact the durable log so the prune survives a restart: a leading
         // snapshot (origin header + base accounts + proof) then the kept suffix.
-        let p_header = self.headers.get(&p).cloned().expect("origin header retained");
-        let base = self.base_accounts.clone().expect("base set above");
         let mut records: Vec<Vec<u8>> = Vec::with_capacity(n - p_idx);
         records.push(
             bincode::serialize(&LogRecord::Snapshot {
                 origin_header: p_header,
-                accounts: base,
-                proof: self.proof.clone(),
+                accounts: new_base.clone(),
+                proof: new_proof.clone(),
             })
             .map_err(|e| BankError::Storage(e.to_string()))?,
         );
@@ -865,7 +1120,22 @@ impl DagChain {
                 );
             }
         }
-        self.log.replace_all(&records).map_err(|e| BankError::Storage(e.to_string()))?;
+        self.log
+            .replace_all(&records)
+            .map_err(|e| BankError::Storage(e.to_string()))?;
+
+        self.engine = engine;
+        self.genesis_dag = p_dag;
+        self.base_accounts = Some(new_base);
+        self.history_pruned = true;
+        self.checkpoint = None;
+        self.headers = new_headers;
+        self.block_txs = new_block_txs;
+        self.blocks = kept;
+        self.state = None;
+        self.executed.clear();
+        self.tips = vec![self.engine.tip().to_bytes()];
+        self.proof = new_proof;
 
         Ok(pruned_count)
     }
@@ -877,9 +1147,21 @@ impl DagChain {
         let transactions = self
             .block_txs
             .get(id)
-            .map(|txs| txs.iter().map(|t| bincode::serialize(t).expect("tx serialize")).collect())
+            .map(|txs| {
+                txs.iter()
+                    .map(|t| {
+                        bincode::serialize(t).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "serialize tx for block reply failed; dropping tx body");
+                            Vec::new()
+                        })
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
-        Some(DagBlock { header, transactions })
+        Some(DagBlock {
+            header,
+            transactions,
+        })
     }
 
     /// True if this block id is known (accepted) by the chain.
@@ -915,11 +1197,7 @@ mod tests {
         p
     }
 
-    fn transfer(
-        from: &solana_keypair::Keypair,
-        to: &Pubkey,
-        lamports: u64,
-    ) -> Transaction {
+    fn transfer(from: &solana_keypair::Keypair, to: &Pubkey, lamports: u64) -> Transaction {
         let ix = solana_system_interface::instruction::transfer(&from.pubkey(), to, lamports);
         Transaction::new_signed_with_payer(&[ix], Some(&from.pubkey()), &[from], env_blockhash())
     }
@@ -941,8 +1219,12 @@ mod tests {
                 vec![(payer.pubkey(), 1_000_000_000)],
             )
             .unwrap();
-            chain.mine(&[transfer(&payer, &a.pubkey(), 100_000_000)]).unwrap();
-            chain.mine(&[transfer(&payer, &a.pubkey(), 50_000_000)]).unwrap();
+            chain
+                .mine(&[transfer(&payer, &a.pubkey(), 100_000_000)])
+                .unwrap();
+            chain
+                .mine(&[transfer(&payer, &a.pubkey(), 50_000_000)])
+                .unwrap();
             let bank = chain.rebuild_state().unwrap();
             assert_eq!(bank.balance(&a.pubkey()), 150_000_000);
             bank.state_root().unwrap()
@@ -961,7 +1243,49 @@ mod tests {
         assert_eq!(chain.block_count(), 3); // genesis + 2
         let bank = chain.rebuild_state().unwrap();
         assert_eq!(bank.balance(&a.pubkey()), 150_000_000);
-        assert_eq!(bank.state_root().unwrap(), root_after_mining, "replay reproduces state");
+        assert_eq!(
+            bank.state_root().unwrap(),
+            root_after_mining,
+            "replay reproduces state"
+        );
+    }
+
+    #[test]
+    fn open_legacy_log_records() {
+        let chain_dir = dir("legacy-log");
+        let log_path = chain_dir.join("dag.log");
+        std::fs::create_dir_all(&chain_dir).unwrap();
+
+        let to = Pubkey::new_unique();
+        let tx = transfer(&solana_keypair::Keypair::new(), &to, 1);
+        let tx_bytes = vec![bincode::serialize(&tx).unwrap()];
+        let legacy = LegacyDagBlock {
+            header: LegacyDagBlockHeader {
+                version: HEADER_VERSION,
+                parents: vec![],
+                timestamp: 1_750_000_000,
+                tx_merkle_root: tx_merkle_root(&tx_bytes),
+                target: easy_target(),
+                nonce: 0,
+                miner: Pubkey::new_unique(),
+            },
+            transactions: tx_bytes.clone(),
+        };
+
+        let log = BlockLog::open(&log_path).unwrap();
+        let rec = bincode::serialize(&LegacyLogRecord::Block(legacy)).unwrap();
+        log.append(&rec).unwrap();
+        drop(log);
+
+        let chain =
+            DagChain::open(chain_dir, 3, easy_target(), Pubkey::new_unique(), 0, vec![]).unwrap();
+        assert_eq!(chain.block_count(), 2, "genesis + legacy block loaded");
+        let order = chain.total_order();
+        assert_eq!(order.len(), 2);
+        assert_eq!(
+            chain.get_block(&order[1]).unwrap().header.version,
+            HEADER_VERSION
+        );
     }
 
     #[test]
@@ -985,7 +1309,9 @@ mod tests {
             )
             .unwrap();
             // block1 off genesis: payer -> A
-            chain.mine(&[transfer(&payer, &a.pubkey(), 100_000_000)]).unwrap();
+            chain
+                .mine(&[transfer(&payer, &a.pubkey(), 100_000_000)])
+                .unwrap();
             // block2 is a parallel block also off genesis (built as an "external" block):
             // temporarily point tips at genesis to build it, then accept it.
             let block2 = {
@@ -1002,14 +1328,24 @@ mod tests {
             };
             chain.accept(block2).unwrap();
             // merge block3: references both current tips (block1 + block2), spends A->B
-            chain.mine(&[transfer(&a, &b.pubkey(), 10_000_000)]).unwrap();
+            chain
+                .mine(&[transfer(&a, &b.pubkey(), 10_000_000)])
+                .unwrap();
 
             let bank = chain.rebuild_state().unwrap();
-            (bank.state_root().unwrap(), bank.balance(&a.pubkey()), bank.balance(&b.pubkey()))
+            (
+                bank.state_root().unwrap(),
+                bank.balance(&a.pubkey()),
+                bank.balance(&b.pubkey()),
+            )
         };
 
         let (root1, a_bal, b_bal) = run("merge1");
-        assert_eq!(a_bal, 100_000_000 - 10_000_000 - 5_000, "A funded before spend across the merge");
+        assert_eq!(
+            a_bal,
+            100_000_000 - 10_000_000 - 5_000,
+            "A funded before spend across the merge"
+        );
         assert_eq!(b_bal, 60_000_000);
         let (root2, ..) = run("merge2");
         assert_eq!(root1, root2, "deterministic across runs");
@@ -1031,9 +1367,15 @@ mod tests {
         let mut c2 = DagChain::open(dir("c2"), 3, easy_target(), miner, 0, allocs.clone()).unwrap();
 
         // Miner 1 builds a two-block chain; miner 2 builds a parallel block.
-        let b1 = c1.mine(&[transfer(&payer, &a.pubkey(), 100_000_000)]).unwrap();
-        let b2 = c1.mine(&[transfer(&payer, &b.pubkey(), 50_000_000)]).unwrap();
-        let b3 = c2.mine(&[transfer(&payer, &a.pubkey(), 10_000_000)]).unwrap();
+        let b1 = c1
+            .mine(&[transfer(&payer, &a.pubkey(), 100_000_000)])
+            .unwrap();
+        let b2 = c1
+            .mine(&[transfer(&payer, &b.pubkey(), 50_000_000)])
+            .unwrap();
+        let b3 = c2
+            .mine(&[transfer(&payer, &a.pubkey(), 10_000_000)])
+            .unwrap();
 
         // Gossip: exchange each other's blocks (in dependency order).
         c2.accept(b1).unwrap();
@@ -1041,7 +1383,11 @@ mod tests {
         c1.accept(b3).unwrap();
 
         // Both nodes now hold the same block set → identical order and state.
-        assert_eq!(c1.total_order(), c2.total_order(), "miners converge on one order");
+        assert_eq!(
+            c1.total_order(),
+            c2.total_order(),
+            "miners converge on one order"
+        );
         let r1 = c1.rebuild_state().unwrap().state_root().unwrap();
         let r2 = c2.rebuild_state().unwrap().state_root().unwrap();
         assert_eq!(r1, r2, "miners converge on one state");
@@ -1067,7 +1413,11 @@ mod tests {
         )
         .unwrap();
         // During warmup next_target == genesis target.
-        assert_eq!(chain.next_target(), easy_target(), "warmup holds genesis target");
+        assert_eq!(
+            chain.next_target(),
+            easy_target(),
+            "warmup holds genesis target"
+        );
         let base = 2_000_000i64;
         for i in 0..=window {
             chain.mine_at(&[], base + (i as i64)).unwrap(); // 1s apart
@@ -1091,8 +1441,15 @@ mod tests {
         let miner = Pubkey::new_unique();
         let allocs = vec![(payer.pubkey(), 1_000_000_000)];
         // reward > 0 so coinbase is exercised on both paths.
-        let mut chain =
-            DagChain::open(dir("vstate"), 3, easy_target(), miner, 1_000_000, allocs.clone()).unwrap();
+        let mut chain = DagChain::open(
+            dir("vstate"),
+            3,
+            easy_target(),
+            miner,
+            1_000_000,
+            allocs.clone(),
+        )
+        .unwrap();
 
         let check = |chain: &mut DagChain| {
             let v = chain.virtual_state().unwrap().state_root().unwrap();
@@ -1100,15 +1457,26 @@ mod tests {
             assert_eq!(v, r, "virtual state diverged from full replay");
         };
 
-        chain.mine(&[transfer(&payer, &a.pubkey(), 100_000_000)]).unwrap();
+        chain
+            .mine(&[transfer(&payer, &a.pubkey(), 100_000_000)])
+            .unwrap();
         check(&mut chain); // first call: full rebuild
-        chain.mine(&[transfer(&payer, &b.pubkey(), 50_000_000)]).unwrap();
+        chain
+            .mine(&[transfer(&payer, &b.pubkey(), 50_000_000)])
+            .unwrap();
         check(&mut chain); // append fast path
 
         // A parallel block off genesis, then a merge that spends from A.
         let block2 = {
-            let tmp =
-                DagChain::open(dir("vstate-side"), 3, easy_target(), miner, 1_000_000, allocs).unwrap();
+            let tmp = DagChain::open(
+                dir("vstate-side"),
+                3,
+                easy_target(),
+                miner,
+                1_000_000,
+                allocs,
+            )
+            .unwrap();
             tmp.build_block(&[transfer(&payer, &a.pubkey(), 7_000_000)])
         };
         chain.accept(block2).unwrap();
@@ -1167,10 +1535,19 @@ mod tests {
         while !meets_target(&h.id(), &target) {
             h.nonce = h.nonce.wrapping_add(1);
         }
-        chain.accept(DagBlock { header: h, transactions: vec![] }).unwrap();
+        chain
+            .accept(DagBlock {
+                header: h,
+                transactions: vec![],
+            })
+            .unwrap();
 
         // The checkpoint prefix is untouched, so the rebuild runs from it.
-        assert_eq!(chain.checkpoint.as_ref().unwrap().len, cp_len, "checkpoint unchanged");
+        assert_eq!(
+            chain.checkpoint.as_ref().unwrap().len,
+            cp_len,
+            "checkpoint unchanged"
+        );
         let v = chain.virtual_state().unwrap().state_root().unwrap();
         let r = chain.rebuild_state().unwrap().state_root().unwrap();
         assert_eq!(v, r, "checkpoint-based rebuild equals full replay");
@@ -1215,7 +1592,101 @@ mod tests {
         assert!(chain.rebuild_state().is_err());
         // But the snapshot-based virtual state still reproduces the same root.
         let after = chain.virtual_state().unwrap().state_root().unwrap();
-        assert_eq!(before, after, "state preserved after pruning finalized tx bodies");
+        assert_eq!(
+            before, after,
+            "state preserved after pruning finalized tx bodies"
+        );
+    }
+
+    #[test]
+    fn virtual_state_error_on_pruned_missing_checkpoint_base() {
+        // If finalized tx bodies are pruned after checkpointing, `prune_finalized_transactions`
+        // sets `history_pruned` with no in-memory base snapshot. A later order
+        // reorg should fail fast instead of silently rebuilding from genesis.
+        let payer = solana_keypair::Keypair::new();
+        let mut chain = DagChain::open(
+            dir("pruned-rebuild-fail"),
+            3,
+            easy_target(),
+            Pubkey::new_unique(),
+            1_000_000,
+            vec![(payer.pubkey(), 1_000_000_000)],
+        )
+        .unwrap();
+        chain.set_finality_depth(2);
+        for i in 0..12 {
+            let txs = if i < 2 {
+                vec![transfer(&payer, &Pubkey::new_unique(), 50_000_000)]
+            } else {
+                vec![]
+            };
+            chain.mine(&txs).unwrap();
+            chain.virtual_state().unwrap();
+        }
+        assert!(
+            chain.checkpoint.is_some(),
+            "checkpoint exists for this scenario"
+        );
+        let pruned = chain.prune_finalized_transactions().unwrap();
+        assert!(
+            pruned > 0,
+            "prune_finalized_transactions removed prefix tx bodies"
+        );
+        assert!(chain.is_history_pruned());
+        assert!(chain.base_accounts.is_none());
+        let last_id = chain.checkpoint.as_ref().unwrap().last_id;
+        chain.checkpoint.as_mut().unwrap().last_id = {
+            let mut tamper = last_id;
+            tamper[0] = tamper[0].wrapping_add(1);
+            tamper
+        };
+        let err = match chain.virtual_state() {
+            Ok(_) => panic!("expected virtual_state to fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("reorg below pruned history"),
+            "unexpected error: {}",
+            err.to_string()
+        );
+    }
+
+    #[test]
+    fn prune_after_finalize_tx_prune_uses_checkpoint_state() {
+        // If finalized tx bodies were already removed, prune() must still be able
+        // to rebuild the re-anchor base from checkpoint state.
+        let payer = solana_keypair::Keypair::new();
+        let mut chain = DagChain::open_with_daa(
+            dir("prune-after-txpurge"),
+            3,
+            easy_target(),
+            Pubkey::new_unique(),
+            1_000_000,
+            vec![(payer.pubkey(), 1_000_000_000)],
+            10,
+            2,
+        )
+        .unwrap();
+        chain.set_finality_depth(2);
+        let target = Pubkey::new_unique();
+        for i in 0..12 {
+            let txs = if i < 2 {
+                vec![transfer(&payer, &target, 50_000_000)]
+            } else {
+                vec![]
+            };
+            chain.mine(&txs).unwrap();
+            chain.virtual_state().unwrap();
+        }
+        let before = chain.virtual_state().unwrap().state_root().unwrap();
+        assert!(chain.prune_finalized_transactions().unwrap() > 0);
+        let pruned = chain.prune().unwrap();
+        assert!(pruned > 0, "prune still succeeds after tx-body pruning");
+        let after = chain.virtual_state().unwrap().state_root().unwrap();
+        assert_eq!(
+            before, after,
+            "prune point base rebuild uses checkpoint snapshot"
+        );
     }
 
     #[test]
@@ -1260,10 +1731,20 @@ mod tests {
         assert!(pruned > 0, "re-anchor pruned some blocks");
         assert!(chain.is_history_pruned());
         assert!(chain.block_count() < pre_blocks, "fewer blocks retained");
+        let post_order = chain.total_order();
+        assert_eq!(
+            chain.tips(),
+            &[post_order.last().copied().expect("order non-empty")],
+            "tips are recomputed from retained tip"
+        );
+        assert!(chain.tips().iter().all(|t| chain.has_block(t)));
 
         // INV1: state preserved.
         let post_root = chain.virtual_state().unwrap().state_root().unwrap();
-        assert_eq!(pre_root, post_root, "INV1: state preserved across re-anchor");
+        assert_eq!(
+            pre_root, post_root,
+            "INV1: state preserved across re-anchor"
+        );
         // rebuild_state (now base-seeded) also reproduces it.
         assert_eq!(
             chain.rebuild_state().unwrap().state_root().unwrap(),
@@ -1272,13 +1753,21 @@ mod tests {
         );
 
         // INV2: the new order is exactly the old order from the pruning point on.
-        let post_order = chain.total_order();
         let p = post_order[0];
-        let p_idx = pre_order.iter().position(|x| *x == p).expect("P present in pre-order");
-        assert_eq!(post_order.as_slice(), &pre_order[p_idx..], "INV2: order suffix preserved");
+        let p_idx = pre_order
+            .iter()
+            .position(|x| *x == p)
+            .expect("P present in pre-order");
+        assert_eq!(
+            post_order.as_slice(),
+            &pre_order[p_idx..],
+            "INV2: order suffix preserved"
+        );
 
         // The chain still works after pruning: mine more, state stays consistent.
-        chain.mine_at(&[transfer(&payer, &a.pubkey(), 1_000_000)], ts).unwrap();
+        chain
+            .mine_at(&[transfer(&payer, &a.pubkey(), 1_000_000)], ts)
+            .unwrap();
         let r1 = chain.virtual_state().unwrap().state_root().unwrap();
         let r2 = chain.rebuild_state().unwrap().state_root().unwrap();
         assert_eq!(r1, r2, "post-prune mining keeps virtual == rebuild");
@@ -1328,16 +1817,29 @@ mod tests {
 
         // Restart: reopen the same data dir; the compacted log re-anchors.
         let mut reopened = open(&d);
-        assert!(reopened.is_history_pruned(), "restart restores pruned state");
-        assert_eq!(reopened.block_count(), post_blocks, "only the kept suffix is reloaded");
-        assert_eq!(reopened.total_order(), post_order, "order reproduced after restart");
+        assert!(
+            reopened.is_history_pruned(),
+            "restart restores pruned state"
+        );
+        assert_eq!(
+            reopened.block_count(),
+            post_blocks,
+            "only the kept suffix is reloaded"
+        );
+        assert_eq!(
+            reopened.total_order(),
+            post_order,
+            "order reproduced after restart"
+        );
         assert_eq!(
             reopened.virtual_state().unwrap().state_root().unwrap(),
             post_root,
             "state reproduced after restart"
         );
         // And it keeps working: mine on top.
-        reopened.mine_at(&[transfer(&payer, &a.pubkey(), 1_000_000)], 2_000_000).unwrap();
+        reopened
+            .mine_at(&[transfer(&payer, &a.pubkey(), 1_000_000)], 2_000_000)
+            .unwrap();
         let v = reopened.virtual_state().unwrap().state_root().unwrap();
         let r = reopened.rebuild_state().unwrap().state_root().unwrap();
         assert_eq!(v, r, "post-restart mining stays consistent");
@@ -1376,7 +1878,9 @@ mod tests {
             node1.virtual_state().unwrap();
         }
         assert!(node1.prune().unwrap() > 0);
-        let snap = node1.export_snapshot().expect("pruned node exports a snapshot");
+        let snap = node1
+            .export_snapshot()
+            .expect("pruned node exports a snapshot");
         let want_order = node1.total_order();
         let want_root = node1.virtual_state().unwrap().state_root().unwrap();
 
@@ -1393,9 +1897,16 @@ mod tests {
         )
         .unwrap();
         node2.set_finality_depth(2);
-        assert!(node2.import_snapshot(&snap).unwrap(), "fresh node adopts the snapshot");
+        assert!(
+            node2.import_snapshot(&snap).unwrap(),
+            "fresh node adopts the snapshot"
+        );
         assert!(node2.is_history_pruned());
-        assert_eq!(node2.total_order(), want_order, "bootstrapped order matches");
+        assert_eq!(
+            node2.total_order(),
+            want_order,
+            "bootstrapped order matches"
+        );
         assert_eq!(
             node2.virtual_state().unwrap().state_root().unwrap(),
             want_root,
@@ -1447,8 +1958,14 @@ mod tests {
         )
         .unwrap();
         node2.set_finality_depth(2);
-        assert!(node2.import_snapshot(&bad).is_err(), "tampered proof must be rejected");
-        assert!(!node2.is_history_pruned(), "rejected import left the node untouched");
+        assert!(
+            node2.import_snapshot(&bad).is_err(),
+            "tampered proof must be rejected"
+        );
+        assert!(
+            !node2.is_history_pruned(),
+            "rejected import left the node untouched"
+        );
     }
 
     #[test]
@@ -1457,17 +1974,9 @@ mod tests {
         // (the prune retained a full LWMA window), so they cannot diverge.
         let miner = Pubkey::new_unique();
         let build = |tag: &str| {
-            let mut c = DagChain::open_with_daa(
-                dir(tag),
-                3,
-                easy_target(),
-                miner,
-                0,
-                vec![],
-                10,
-                5,
-            )
-            .unwrap();
+            let mut c =
+                DagChain::open_with_daa(dir(tag), 3, easy_target(), miner, 0, vec![], 10, 5)
+                    .unwrap();
             c.set_finality_depth(2);
             let mut ts = 500_000i64;
             for _ in 0..24 {
@@ -1479,7 +1988,11 @@ mod tests {
         let mut pruned = build("daawin-a");
         let intact = build("daawin-b");
         // Identical mining sequences ⇒ identical chains ⇒ identical next target.
-        assert_eq!(pruned.next_target(), intact.next_target(), "sanity: chains identical");
+        assert_eq!(
+            pruned.next_target(),
+            intact.next_target(),
+            "sanity: chains identical"
+        );
 
         pruned.prune().unwrap();
         assert!(pruned.is_history_pruned());
@@ -1506,7 +2019,9 @@ mod tests {
             vec![(payer.pubkey(), 1_000_000_000)],
         )
         .unwrap();
-        let mined = chain.mine(&[transfer(&payer, &a.pubkey(), 100_000_000)]).unwrap();
+        let mined = chain
+            .mine(&[transfer(&payer, &a.pubkey(), 100_000_000)])
+            .unwrap();
         let served = chain.get_block(&mined.id()).expect("have the block");
         assert_eq!(served.id(), mined.id(), "reconstructed block id matches");
         assert_eq!(served.transactions, mined.transactions, "txs round-trip");
@@ -1519,7 +2034,8 @@ mod tests {
         // A block whose interlink isn't correctly derived from its selected
         // parent is rejected (interlinks are PoW-committed and validated).
         let miner = Pubkey::new_unique();
-        let mut chain = DagChain::open(dir("forge-il"), 3, easy_target(), miner, 0, vec![]).unwrap();
+        let mut chain =
+            DagChain::open(dir("forge-il"), 3, easy_target(), miner, 0, vec![]).unwrap();
         chain.mine(&[]).unwrap();
         chain.mine(&[]).unwrap();
         let mut block = chain.build_block(&[]); // correct interlink
@@ -1528,7 +2044,10 @@ mod tests {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
         let err = chain.accept(block).unwrap_err();
-        assert!(err.contains("interlink"), "expected interlink rejection, got: {err}");
+        assert!(
+            err.contains("interlink"),
+            "expected interlink rejection, got: {err}"
+        );
     }
 
     #[test]
@@ -1545,8 +2064,15 @@ mod tests {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
         let err = chain.accept(block).unwrap_err();
-        assert!(err.contains("unexpected difficulty"), "expected difficulty rejection, got: {err}");
-        assert_eq!(chain.block_count(), 1, "the lowballed block was not accepted");
+        assert!(
+            err.contains("unexpected difficulty"),
+            "expected difficulty rejection, got: {err}"
+        );
+        assert_eq!(
+            chain.block_count(),
+            1,
+            "the lowballed block was not accepted"
+        );
     }
 
     #[test]
@@ -1574,7 +2100,11 @@ mod tests {
         let wg = work_for_target(&easy_target());
         let wn = work_for_target(&nt);
         // within ~5% of the genesis difficulty
-        assert!(wn >= wg * primitive_types::U256::from(95u64) / primitive_types::U256::from(100u64));
-        assert!(wn <= wg * primitive_types::U256::from(105u64) / primitive_types::U256::from(100u64));
+        assert!(
+            wn >= wg * primitive_types::U256::from(95u64) / primitive_types::U256::from(100u64)
+        );
+        assert!(
+            wn <= wg * primitive_types::U256::from(105u64) / primitive_types::U256::from(100u64)
+        );
     }
 }

@@ -41,8 +41,16 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     /// Serialize the header deterministically (bincode) for hashing and storage.
+    ///
+    /// Serialization should never fail for an in-memory header; if it does, we
+    /// log and return an empty vector instead of panicking. Hashing an empty
+    /// header payload is never a correct chain value and will make the block
+    /// invalid, but it keeps the process alive in degraded IO/format conditions.
     pub fn serialize(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("header serialization is infallible")
+        bincode::serialize(self).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "block header serialization failed; returning empty payload");
+            Vec::new()
+        })
     }
 
     /// The block id: BLAKE3 of the serialized header (includes the nonce).
@@ -74,7 +82,10 @@ pub struct Block {
 
 impl Block {
     pub fn new(header: BlockHeader, transactions: Vec<Vec<u8>>) -> Self {
-        Self { header, transactions }
+        Self {
+            header,
+            transactions,
+        }
     }
 
     pub fn id(&self) -> BlockId {
@@ -116,8 +127,16 @@ pub struct DagBlockHeader {
 
 impl DagBlockHeader {
     /// Serialize the header deterministically (bincode) for hashing and storage.
+    ///
+    /// Serialization should never fail for an in-memory header; if it does, we
+    /// log and return an empty vector instead of panicking. Hashing an empty
+    /// header payload is never a correct chain value and will make the block
+    /// invalid, but it keeps the process alive in degraded IO/format conditions.
     pub fn serialize(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("header serialization is infallible")
+        bincode::serialize(self).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "block header serialization failed; returning empty payload");
+            Vec::new()
+        })
     }
 
     /// The block id = BLAKE3 of the serialized header (also the PoW hash for the
@@ -136,7 +155,10 @@ pub struct DagBlock {
 
 impl DagBlock {
     pub fn new(header: DagBlockHeader, transactions: Vec<Vec<u8>>) -> Self {
-        Self { header, transactions }
+        Self {
+            header,
+            transactions,
+        }
     }
 
     pub fn id(&self) -> BlockId {

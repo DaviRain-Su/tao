@@ -9,6 +9,7 @@ description = "Execute a blockDAG's transactions through the SVM in GHOSTDAG lin
 
 [dependencies]
 tao-ghostdag.workspace = true
+tracing.workspace = true
 tao-runtime.workspace = true
 tao-database.workspace = true
 tao-consensus.workspace = true

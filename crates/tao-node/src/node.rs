@@ -73,7 +73,9 @@ fn decode_txs(serialized: &[Vec<u8>]) -> anyhow::Result<Vec<Transaction>> {
 }
 
 fn signature_bytes(tx: &Transaction) -> Option<[u8; 64]> {
-    tx.signatures.first().and_then(|s| s.as_ref().try_into().ok())
+    tx.signatures
+        .first()
+        .and_then(|s| s.as_ref().try_into().ok())
 }
 
 /// A prepared miner: owns the consensus, log, and execution state.
@@ -94,8 +96,10 @@ pub struct Miner {
 pub fn prepare(opts: MineOptions) -> anyhow::Result<(Miner, Arc<Shared>)> {
     let g = genesis_header(&opts.genesis).map_err(|e| anyhow!("genesis header: {e}"))?;
     let genesis_hash = g.id();
-    let params =
-        DifficultyParams::new(opts.genesis.pow.target_block_time_secs, opts.genesis.pow.lwma_window);
+    let params = DifficultyParams::new(
+        opts.genesis.pow.target_block_time_secs,
+        opts.genesis.pow.lwma_window,
+    );
     let mut chain = ChainState::new(g, params, opts.pow.clone());
 
     // Account store is a derived cache: wipe and rebuild from the log.
@@ -125,7 +129,11 @@ pub fn prepare(opts: MineOptions) -> anyhow::Result<(Miner, Arc<Shared>)> {
         }
     }
     if replayed > 0 {
-        tracing::info!(replayed, height = chain.height(), "replayed and re-executed block log");
+        tracing::info!(
+            replayed,
+            height = chain.height(),
+            "replayed and re-executed block log"
+        );
     }
 
     let shared = Arc::new(Shared::new(
@@ -201,7 +209,12 @@ impl Miner {
             }
 
             if self.mine {
-                self.mine_one(&shared, network.as_ref(), &mut produced, &mut last_block_time)?;
+                self.mine_one(
+                    &shared,
+                    network.as_ref(),
+                    &mut produced,
+                    &mut last_block_time,
+                )?;
             } else if !did_work {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -225,15 +238,25 @@ impl Miner {
         let parent_hash = Hash::new_from_array(self.chain.tip_id());
 
         let txs = shared.drain_mempool();
-        let serialized: Vec<Vec<u8>> =
-            txs.iter().map(|t| bincode::serialize(t).expect("tx serialize")).collect();
-        let exec = self.bank.execute_block(&txs, parent_hash, &self.miner, reward)?;
+        let serialized: Vec<Vec<u8>> = txs
+            .iter()
+            .map(|t| bincode::serialize(t).expect("tx serialize"))
+            .collect();
+        let exec = self
+            .bank
+            .execute_block(&txs, parent_hash, &self.miner, reward)?;
 
-        let mut header = self.chain.build_candidate(self.miner, unix_now(), &serialized);
+        let mut header = self
+            .chain
+            .build_candidate(self.miner, unix_now(), &serialized);
         header.state_root = Hash::new_from_array(exec.state_root);
 
         let grind_start = Instant::now();
-        let batch = if pow.name().contains("matmul") { GRIND_BATCH_SLOW } else { GRIND_BATCH_FAST };
+        let batch = if pow.name().contains("matmul") {
+            GRIND_BATCH_SLOW
+        } else {
+            GRIND_BATCH_FAST
+        };
         let mut total_attempts = 0u64;
         loop {
             match grind(&mut header, pow, batch) {
@@ -305,7 +328,9 @@ impl Miner {
             tracing::warn!(height, error = %e, "rejected peer block (orphan/invalid)");
             return Ok(());
         }
-        let exec = self.bank.execute_block(&txs, parent_hash, &block_miner, reward)?;
+        let exec = self
+            .bank
+            .execute_block(&txs, parent_hash, &block_miner, reward)?;
         if exec.state_root != expected {
             tracing::error!(height, "peer block state-root mismatch");
             return Ok(());
@@ -344,5 +369,8 @@ fn leading_zero_bits(bytes: &[u8; 32]) -> u32 {
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

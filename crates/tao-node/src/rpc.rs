@@ -49,7 +49,9 @@ pub async fn serve(
 
 async fn handle(State(shared): State<Arc<Shared>>, Json(body): Json<Value>) -> Json<Value> {
     if let Some(batch) = body.as_array() {
-        Json(Value::Array(batch.iter().map(|r| handle_one(&shared, r)).collect()))
+        Json(Value::Array(
+            batch.iter().map(|r| handle_one(&shared, r)).collect(),
+        ))
     } else {
         Json(handle_one(&shared, &body))
     }
@@ -83,8 +85,10 @@ fn parse_pubkey(s: &str) -> Result<Pubkey, (i64, String)> {
     let bytes = bs58::decode(s)
         .into_vec()
         .map_err(|_| (INVALID_PARAMS, "invalid base58 pubkey".into()))?;
-    let arr: [u8; 32] =
-        bytes.as_slice().try_into().map_err(|_| (INVALID_PARAMS, "pubkey must be 32 bytes".into()))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| (INVALID_PARAMS, "pubkey must be 32 bytes".into()))?;
     Ok(Pubkey::from(arr))
 }
 
@@ -216,9 +220,15 @@ fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult {
             let values: Vec<Value> = sigs
                 .iter()
                 .map(|s| {
-                    let Some(s) = s.as_str() else { return Value::Null };
-                    let Ok(bytes) = bs58::decode(s).into_vec() else { return Value::Null };
-                    let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice()) else { return Value::Null };
+                    let Some(s) = s.as_str() else {
+                        return Value::Null;
+                    };
+                    let Ok(bytes) = bs58::decode(s).into_vec() else {
+                        return Value::Null;
+                    };
+                    let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice()) else {
+                        return Value::Null;
+                    };
                     match shared.signature_status(&arr) {
                         Some(result) => json!({
                             "slot": slot,

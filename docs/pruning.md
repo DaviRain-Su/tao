@@ -7,6 +7,12 @@ How a node bounds growth by discarding finalized history. Two layers:
    checkpoint snapshot, so they are redundant for state. Consensus-safe: touches
    no ordering / difficulty / GHOSTDAG computation (headers + engine retained).
 
+   **Durability note:** this operation is intentionally lightweight and **not
+   compacted to `dag.log` by itself**. On restart, full block logs are replayed
+   and transaction bodies reappear, so this is mainly a live-memory optimization.
+   Use `prune` after checkpointed finalize pruning for durable, restart-persistent
+   history shrink on both headers and state.
+
 2. **Re-anchor pruning (this document, `prune`)** — discard the *headers and
    GHOSTDAG/reachability data* of finalized blocks too, by re-rooting the DAG at a
    finalized **pruning point** `P`. `P` becomes the new origin; its past is gone;
@@ -84,10 +90,13 @@ pruning point descends from genesis on a real chain, before adopting its snapsho
    selected ancestor of level ≥ k. Computed at build time from the selected
    parent (`interlink_for_parent`), PoW-committed, and **validated in `accept`**
    so it can't be forged.
-3. **Proof construction (`build_proof_for`).** Built before pruning (while
-   ancestors exist) and retained: walk the highest-level interlink back-pointer
-   from P until genesis — an interlink-connected, genesis-anchored header chain
-   whose length is logarithmic-ish in the work.
+3. **Proof construction (`build_proof_for`).** The NiPoPoW "Prove" shape: process
+   levels high→low; at each level μ collect the level-≥μ chain from P back to a
+   moving anchor, then advance the anchor `m` (the security parameter
+   `PROOF_SECURITY_M`) blocks toward P so lower levels only densify the recent
+   part. Deep history is covered by rare high-level blocks, recent history densely
+   — `O(m·log(work))` headers, interlink-connected and anchored at genesis. Built
+   before pruning (while ancestors exist) and retained.
 4. **Verification (`verify_proof`).** A joiner checks the proof is anchored at its
    own genesis, ends at the claimed origin, every non-genesis header has valid
    PoW, and consecutive headers are interlink/parent-connected; it returns the
@@ -98,12 +107,11 @@ Tested: `snapshot_sync_bootstraps_a_fresh_node` (verified bootstrap),
 
 ### Remaining refinements (not blocking)
 
-- **Optimal succinctness / security bounds.** The proof uses the highest-interlink
-  walk; the full NiPoPoW "goodness" construction (guaranteed `O(polylog)` size and
-  formal security parameters) and **most-work selection across competing peers**
-  (a joiner currently adopts the first valid proof — fine under one honest peer)
-  are refinements.
+- **Most-work selection across competing peers.** A joiner currently adopts the
+  first valid proof (fine under one honest peer); comparing proofs from multiple
+  peers by accumulated work (the NiPoPoW "maxchain" rule) hardens against a lone
+  dishonest peer. (Next.)
 - **Multi-prune proof chaining.** A genesis-anchored proof is rebuilt at each
   prune; once a node has pruned twice, the older ancestors are gone, so the proof
   anchors at genesis only while built from headers that still reach it. Chaining
-  successive proofs across repeated prunes is a refinement.
+  successive proofs across repeated prunes is a refinement. (Next.)

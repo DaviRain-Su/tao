@@ -3970,6 +3970,7 @@ dependencies = [
  "tao-database",
  "tao-ghostdag",
  "tao-runtime",
+ "tracing",
 ]
 
 [[package]]

@@ -130,13 +130,42 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Init { data_dir } => init(data_dir),
         Command::Run {
-            config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair, matmul,
-            matmul_n, matmul_rank, pow_switch_height,
+            config,
+            data_dir,
+            mine,
+            miner,
+            blocks,
+            rpc,
+            rpc_port,
+            listen,
+            peers,
+            faucet_keypair,
+            matmul,
+            matmul_n,
+            matmul_rank,
+            pow_switch_height,
         } => run(RunArgs {
-            config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair, matmul,
-            matmul_n, matmul_rank, pow_switch_height,
+            config,
+            data_dir,
+            mine,
+            miner,
+            blocks,
+            rpc,
+            rpc_port,
+            listen,
+            peers,
+            faucet_keypair,
+            matmul,
+            matmul_n,
+            matmul_rank,
+            pow_switch_height,
         }),
-        Command::DagMine { data_dir, miner, blocks, k } => dag_mine(data_dir, miner, blocks, k),
+        Command::DagMine {
+            data_dir,
+            miner,
+            blocks,
+            k,
+        } => dag_mine(data_dir, miner, blocks, k),
         Command::DagRun {
             data_dir,
             miner,
@@ -146,7 +175,16 @@ fn main() -> anyhow::Result<()> {
             blocks,
             k,
             finality_depth,
-        } => dag_run(data_dir, miner, listen, peers, block_interval_ms, blocks, k, finality_depth),
+        } => dag_run(
+            data_dir,
+            miner,
+            listen,
+            peers,
+            block_interval_ms,
+            blocks,
+            k,
+            finality_depth,
+        ),
     }
 }
 
@@ -198,7 +236,6 @@ fn dag_open(
 /// the current tips, accept peer blocks (buffering orphans until their parents
 /// arrive), and converge with peers on one GHOSTDAG order.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn dag_run(
     data_dir: PathBuf,
     miner: String,
@@ -217,7 +254,9 @@ fn dag_run(
     let (mut chain, miner_pubkey) = dag_open(data_dir, &miner, k)?;
     chain.set_finality_depth(finality_depth);
 
-    let listen_addr: SocketAddr = listen.parse().map_err(|e| anyhow::anyhow!("bad --listen: {e}"))?;
+    let listen_addr: SocketAddr = listen
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad --listen: {e}"))?;
     let peer_addrs: Vec<SocketAddr> = peers
         .unwrap_or_default()
         .split(',')
@@ -228,7 +267,8 @@ fn dag_run(
         .map_err(|e| anyhow::anyhow!("bad --peers: {e}"))?;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let network = Network::start(listen_addr, peer_addrs, tx).map_err(|e| anyhow::anyhow!("p2p: {e}"))?;
+    let network =
+        Network::start(listen_addr, peer_addrs, tx).map_err(|e| anyhow::anyhow!("p2p: {e}"))?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -278,13 +318,13 @@ fn dag_run(
                         network.broadcast(&NetMsg::Snapshot(snap));
                     }
                 }
-                NetMsg::Snapshot(bytes) => {
-                    match chain.import_snapshot(&bytes) {
-                        Ok(true) => tracing::info!(blocks = chain.block_count(), "bootstrapped from snapshot"),
-                        Ok(false) => {}
-                        Err(e) => tracing::warn!(error = %e, "snapshot import failed"),
+                NetMsg::Snapshot(bytes) => match chain.import_snapshot(&bytes) {
+                    Ok(true) => {
+                        tracing::info!(blocks = chain.block_count(), "bootstrapped from snapshot")
                     }
-                }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(error = %e, "snapshot import failed"),
+                },
                 NetMsg::NewTx(_) => {}
             }
         }
@@ -296,6 +336,7 @@ fn dag_run(
                 match chain.accept(block.clone()) {
                     Ok(()) => progress = true,
                     Err(e) if e.contains("orphan") => still.push(block),
+                    Err(e) if e.contains("pruned") => {}
                     Err(_) => {} // invalid PoW / lowballed difficulty — drop
                 }
             }
@@ -339,7 +380,11 @@ fn dag_run(
             let _ = chain.virtual_state();
             if let Ok(n) = chain.prune() {
                 if n > 0 {
-                    tracing::info!(pruned = n, blocks = chain.block_count(), "re-anchored / pruned");
+                    tracing::info!(
+                        pruned = n,
+                        blocks = chain.block_count(),
+                        "re-anchored / pruned"
+                    );
                 }
             }
             last_maint = Instant::now();
@@ -372,8 +417,13 @@ fn dag_run(
     }
 
     let (balance, root) = {
-        let bank = chain.virtual_state().map_err(|e| anyhow::anyhow!("virtual state: {e}"))?;
-        (bank.balance(&miner_pubkey), bank.state_root().map_err(|e| anyhow::anyhow!("{e}"))?)
+        let bank = chain
+            .virtual_state()
+            .map_err(|e| anyhow::anyhow!("virtual state: {e}"))?;
+        (
+            bank.balance(&miner_pubkey),
+            bank.state_root().map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
     };
     println!(
         "stopped: blocks={} tips={} order={} miner_balance={} state_root={}",
@@ -396,8 +446,14 @@ fn dag_mine(data_dir: PathBuf, miner: String, blocks: u64, k: u16) -> anyhow::Re
     }
 
     let (balance, state_root) = {
-        let bank = chain.virtual_state().map_err(|e| anyhow::anyhow!("virtual state: {e}"))?;
-        (bank.balance(&miner_pubkey), bank.state_root().map_err(|e| anyhow::anyhow!("state root: {e}"))?)
+        let bank = chain
+            .virtual_state()
+            .map_err(|e| anyhow::anyhow!("virtual state: {e}"))?;
+        (
+            bank.balance(&miner_pubkey),
+            bank.state_root()
+                .map_err(|e| anyhow::anyhow!("state root: {e}"))?,
+        )
     };
     let order_len = chain.total_order().len();
 
@@ -423,7 +479,10 @@ fn init(data_dir: PathBuf) -> anyhow::Result<()> {
     let mut config = NodeConfig::default();
     config.data_dir = data_dir.clone();
     std::fs::write(data_dir.join("config.toml"), config.to_toml()?)?;
-    std::fs::write(data_dir.join("genesis.toml"), GenesisConfig::devnet().to_toml()?)?;
+    std::fs::write(
+        data_dir.join("genesis.toml"),
+        GenesisConfig::devnet().to_toml()?,
+    )?;
     println!("Initialized Tao data directory at {}", data_dir.display());
     Ok(())
 }
@@ -462,13 +521,17 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     };
     let data_dir = args.data_dir.unwrap_or_else(|| config.data_dir.clone());
     let genesis_path = data_dir.join("genesis.toml");
-    let genesis =
-        if genesis_path.exists() { GenesisConfig::load(&genesis_path)? } else { GenesisConfig::devnet() };
+    let genesis = if genesis_path.exists() {
+        GenesisConfig::load(&genesis_path)?
+    } else {
+        GenesisConfig::devnet()
+    };
 
     if !args.mine && !args.rpc && args.listen.is_none() {
         println!(
             "tao-node {} — network '{}'. Pass --mine and/or --rpc / --listen ADDR.",
-            tao_core::VERSION, config.network
+            tao_core::VERSION,
+            config.network
         );
         return Ok(());
     }
@@ -478,7 +541,9 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         let s = args
             .miner
             .or_else(|| config.miner.reward_address.clone())
-            .ok_or_else(|| anyhow::anyhow!("--mine requires --miner <PUBKEY> or miner.reward_address"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("--mine requires --miner <PUBKEY> or miner.reward_address")
+            })?;
         Pubkey::from_str(&s).map_err(|e| anyhow::anyhow!("invalid miner address '{s}': {e}"))?
     } else {
         Pubkey::default()
@@ -528,8 +593,9 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // P2P networking.
     let (network, inbound_rx) = if let Some(listen_str) = args.listen {
-        let listen_addr: SocketAddr =
-            listen_str.parse().map_err(|e| anyhow::anyhow!("bad --listen address: {e}"))?;
+        let listen_addr: SocketAddr = listen_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("bad --listen address: {e}"))?;
         let peers: Vec<SocketAddr> = args
             .peers
             .unwrap_or_default()
