@@ -3954,6 +3954,9 @@ version = "0.1.0"
 name = "tao-dagvm"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "blake3",
+ "serde",
  "solana-account",
  "solana-hash 4.2.0",
  "solana-keypair",
@@ -3962,6 +3965,7 @@ dependencies = [
  "solana-signer",
  "solana-system-interface 3.1.0",
  "solana-transaction",
+ "tao-consensus",
  "tao-database",
  "tao-ghostdag",
  "tao-runtime",
@@ -4019,6 +4023,7 @@ dependencies = [
  "solana-transaction",
  "tao-consensus",
  "tao-core",
+ "tao-dagvm",
  "tao-database",
  "tao-mempool",
  "tao-p2p",

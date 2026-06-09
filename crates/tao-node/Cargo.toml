@@ -19,6 +19,7 @@ tao-mempool.workspace = true
 tao-database.workspace = true
 tao-runtime.workspace = true
 tao-p2p.workspace = true
+tao-dagvm.workspace = true
 clap.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

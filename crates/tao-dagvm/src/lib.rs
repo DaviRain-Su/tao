@@ -10,6 +10,9 @@
 //! single agreed total order is what lets the SVM (which needs one order) run on
 //! a blockDAG unchanged.
 
+mod dag_chain;
+pub use dag_chain::{DagBlock, DagBlockHeader, DagChain};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

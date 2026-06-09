@@ -82,6 +82,20 @@ enum Command {
         #[arg(long)]
         faucet_keypair: Option<PathBuf>,
     },
+    /// Mine a single-node blockDAG (GHOSTDAG + reachability + SVM linearization).
+    DagMine {
+        #[arg(long, default_value = ".tao-dag")]
+        data_dir: PathBuf,
+        /// Base58 reward address for mined blocks.
+        #[arg(long)]
+        miner: String,
+        /// Number of DAG blocks to mine.
+        #[arg(long, default_value_t = 10)]
+        blocks: u64,
+        /// GHOSTDAG anticone bound k.
+        #[arg(long, default_value_t = 18)]
+        k: u16,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -96,7 +110,73 @@ fn main() -> anyhow::Result<()> {
             config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers, faucet_keypair, matmul,
             matmul_n, matmul_rank, pow_switch_height,
         }),
+        Command::DagMine { data_dir, miner, blocks, k } => dag_mine(data_dir, miner, blocks, k),
     }
+}
+
+/// Mine a single-node blockDAG using the ported reachability + GHOSTDAG, with
+/// state computed by executing the GHOSTDAG total order through the SVM.
+fn dag_mine(data_dir: PathBuf, miner: String, blocks: u64, k: u16) -> anyhow::Result<()> {
+    use std::str::FromStr;
+
+    std::fs::create_dir_all(&data_dir)?;
+    let genesis_path = data_dir.join("genesis.toml");
+    let genesis = if genesis_path.exists() {
+        GenesisConfig::load(&genesis_path)?
+    } else {
+        let g = GenesisConfig::devnet();
+        std::fs::write(&genesis_path, g.to_toml()?)?;
+        g
+    };
+
+    let miner_pubkey = Pubkey::from_str(&miner)
+        .map_err(|e| anyhow::anyhow!("invalid miner address '{miner}': {e}"))?;
+    let target = tao_consensus::genesis::parse_target(&genesis.pow.initial_target)
+        .map_err(|e| anyhow::anyhow!("bad genesis target: {e}"))?;
+
+    let allocations: Vec<(Pubkey, u64)> = genesis
+        .allocations
+        .iter()
+        .map(|a| {
+            Pubkey::from_str(&a.address)
+                .map(|pk| (pk, a.lamports))
+                .map_err(|e| anyhow::anyhow!("bad allocation '{}': {e}", a.address))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    let mut chain = tao_dagvm::DagChain::open(
+        data_dir,
+        k,
+        target,
+        miner_pubkey,
+        genesis.reward.initial_lamports,
+        allocations,
+    )
+    .map_err(|e| anyhow::anyhow!("open dag chain: {e}"))?;
+
+    for _ in 0..blocks {
+        chain.mine(&[]).map_err(|e| anyhow::anyhow!("mine: {e}"))?;
+    }
+
+    let bank = chain.rebuild_state().map_err(|e| anyhow::anyhow!("rebuild state: {e}"))?;
+    let state_root = bank.state_root().map_err(|e| anyhow::anyhow!("state root: {e}"))?;
+    let order = chain.total_order();
+
+    println!("blockDAG mined:");
+    println!("  blocks (incl. genesis): {}", chain.block_count());
+    println!("  tips:                   {}", chain.tips().len());
+    println!("  total-order length:     {}", order.len());
+    println!("  miner balance:          {}", bank.balance(&miner_pubkey));
+    println!("  state root:             {}", hex_bytes(&state_root));
+    Ok(())
+}
+
+fn hex_bytes(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn init(data_dir: PathBuf) -> anyhow::Result<()> {

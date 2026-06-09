@@ -11,8 +11,15 @@ description = "Execute a blockDAG's transactions through the SVM in GHOSTDAG lin
 tao-ghostdag.workspace = true
 tao-runtime.workspace = true
 tao-database.workspace = true
+tao-consensus.workspace = true
 solana-transaction.workspace = true
 solana-hash.workspace = true
+solana-pubkey.workspace = true
+solana-account.workspace = true
+solana-sdk-ids.workspace = true
+serde.workspace = true
+bincode.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 solana-keypair.workspace = true
