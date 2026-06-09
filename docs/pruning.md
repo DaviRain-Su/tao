@@ -147,7 +147,14 @@ logs.
   strictly more-work proof, and a node that built/pruned its own chain never
   adopts. `verify_proof` returns the certified work; proofs anchor at the node's
   original genesis. Tested by `most_work_proof_wins`.
-- **Multi-prune proof chaining — remaining.** A genesis-anchored proof is rebuilt
-  at each prune; once a node has pruned twice, the older ancestors are gone, so
-  the proof anchors at genesis only while built from headers that still reach it.
-  Chaining successive proofs across repeated prunes is the last refinement.
+- **Multi-prune proof chaining — done.** Once a node has pruned twice, the
+  ancestors below the first pruning point are gone, so the fresh walk only spans
+  current-origin→P. `prune` chains it onto the retained proof
+  (genesis→current-origin), so the combined proof stays genesis-anchored across
+  any number of prunes. Tested by `proof_chains_across_repeated_prunes`.
+
+All three NiPoPoW refinements are complete; trustless pruned-node sync is at
+Kaspa parity. (Caveat: the tao-dagvm test binary can flake under very high test
+parallelism — many RocksDB instances contend in one process — but is
+deterministic alone and at `--test-threads=4`; a harness artifact, not a runtime
+issue.)
