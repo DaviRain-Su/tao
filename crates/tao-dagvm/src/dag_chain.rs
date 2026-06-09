@@ -166,6 +166,9 @@ impl DagChain {
     /// Accept an externally-produced block (e.g. from a peer): validate PoW,
     /// persist, and apply.
     pub fn accept(&mut self, block: DagBlock) -> Result<(), String> {
+        if self.blocks.contains(&block.id()) {
+            return Ok(()); // already have it (gossip duplicate)
+        }
         if !meets_target(&block.header.id(), &block.header.target) {
             return Err("invalid proof-of-work".into());
         }
@@ -366,5 +369,36 @@ mod tests {
         let (root2, ..) = run("merge2");
         assert_eq!(root1, root2, "deterministic across runs");
         let _ = system_program::id();
+    }
+
+    #[test]
+    fn two_miners_converge() {
+        // Two independent miners produce blocks; after exchanging them, both
+        // nodes must reach the SAME GHOSTDAG order and the SAME state — the
+        // property that makes a multi-miner blockDAG sound.
+        let payer = solana_keypair::Keypair::new();
+        let a = solana_keypair::Keypair::new();
+        let b = solana_keypair::Keypair::new();
+        let miner = Pubkey::new_unique();
+        let allocs = vec![(payer.pubkey(), 1_000_000_000)];
+
+        let mut c1 = DagChain::open(dir("c1"), 3, easy_target(), miner, 0, allocs.clone()).unwrap();
+        let mut c2 = DagChain::open(dir("c2"), 3, easy_target(), miner, 0, allocs.clone()).unwrap();
+
+        // Miner 1 builds a two-block chain; miner 2 builds a parallel block.
+        let b1 = c1.mine(&[transfer(&payer, &a.pubkey(), 100_000_000)]).unwrap();
+        let b2 = c1.mine(&[transfer(&payer, &b.pubkey(), 50_000_000)]).unwrap();
+        let b3 = c2.mine(&[transfer(&payer, &a.pubkey(), 10_000_000)]).unwrap();
+
+        // Gossip: exchange each other's blocks (in dependency order).
+        c2.accept(b1).unwrap();
+        c2.accept(b2).unwrap();
+        c1.accept(b3).unwrap();
+
+        // Both nodes now hold the same block set → identical order and state.
+        assert_eq!(c1.total_order(), c2.total_order(), "miners converge on one order");
+        let r1 = c1.rebuild_state().unwrap().state_root().unwrap();
+        let r2 = c2.rebuild_state().unwrap().state_root().unwrap();
+        assert_eq!(r1, r2, "miners converge on one state");
     }
 }

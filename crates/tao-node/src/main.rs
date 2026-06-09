@@ -96,6 +96,28 @@ enum Command {
         #[arg(long, default_value_t = 18)]
         k: u16,
     },
+    /// Run a networked blockDAG node (multi-miner gossip over TCP).
+    DagRun {
+        #[arg(long, default_value = ".tao-dag")]
+        data_dir: PathBuf,
+        /// Base58 reward address for mined blocks.
+        #[arg(long)]
+        miner: String,
+        /// P2P listen address, e.g. 127.0.0.1:9101.
+        #[arg(long)]
+        listen: String,
+        /// Comma-separated bootstrap peer addresses to dial.
+        #[arg(long)]
+        peers: Option<String>,
+        /// Milliseconds between mined blocks.
+        #[arg(long, default_value_t = 500)]
+        block_interval_ms: u64,
+        /// Stop after mining this many blocks. `0` = until Ctrl-C.
+        #[arg(long, default_value_t = 0)]
+        blocks: u64,
+        #[arg(long, default_value_t = 18)]
+        k: u16,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -111,7 +133,160 @@ fn main() -> anyhow::Result<()> {
             matmul_n, matmul_rank, pow_switch_height,
         }),
         Command::DagMine { data_dir, miner, blocks, k } => dag_mine(data_dir, miner, blocks, k),
+        Command::DagRun { data_dir, miner, listen, peers, block_interval_ms, blocks, k } => {
+            dag_run(data_dir, miner, listen, peers, block_interval_ms, blocks, k)
+        }
     }
+}
+
+/// Helper: build the DagChain config (genesis target + allocations) shared by
+/// the dag-mine and dag-run commands.
+fn dag_open(
+    data_dir: PathBuf,
+    miner: &str,
+    k: u16,
+) -> anyhow::Result<(tao_dagvm::DagChain, Pubkey)> {
+    use std::str::FromStr;
+    std::fs::create_dir_all(&data_dir)?;
+    let genesis_path = data_dir.join("genesis.toml");
+    let genesis = if genesis_path.exists() {
+        GenesisConfig::load(&genesis_path)?
+    } else {
+        let g = GenesisConfig::devnet();
+        std::fs::write(&genesis_path, g.to_toml()?)?;
+        g
+    };
+    let miner_pubkey =
+        Pubkey::from_str(miner).map_err(|e| anyhow::anyhow!("invalid miner '{miner}': {e}"))?;
+    let target = tao_consensus::genesis::parse_target(&genesis.pow.initial_target)
+        .map_err(|e| anyhow::anyhow!("bad genesis target: {e}"))?;
+    let allocations: Vec<(Pubkey, u64)> = genesis
+        .allocations
+        .iter()
+        .map(|a| {
+            Pubkey::from_str(&a.address)
+                .map(|pk| (pk, a.lamports))
+                .map_err(|e| anyhow::anyhow!("bad allocation '{}': {e}", a.address))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let chain = tao_dagvm::DagChain::open(
+        data_dir,
+        k,
+        target,
+        miner_pubkey,
+        genesis.reward.initial_lamports,
+        allocations,
+    )
+    .map_err(|e| anyhow::anyhow!("open dag chain: {e}"))?;
+    Ok((chain, miner_pubkey))
+}
+
+/// A networked multi-miner blockDAG node: gossip DAG blocks over TCP, mine on
+/// the current tips, accept peer blocks (buffering orphans until their parents
+/// arrive), and converge with peers on one GHOSTDAG order.
+#[allow(clippy::too_many_arguments)]
+fn dag_run(
+    data_dir: PathBuf,
+    miner: String,
+    listen: String,
+    peers: Option<String>,
+    block_interval_ms: u64,
+    blocks: u64,
+    k: u16,
+) -> anyhow::Result<()> {
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+    use tao_dagvm::DagBlock;
+    use tao_p2p::{NetMsg, Network};
+
+    let (mut chain, miner_pubkey) = dag_open(data_dir, &miner, k)?;
+
+    let listen_addr: SocketAddr = listen.parse().map_err(|e| anyhow::anyhow!("bad --listen: {e}"))?;
+    let peer_addrs: Vec<SocketAddr> = peers
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<SocketAddr>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("bad --peers: {e}"))?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let network = Network::start(listen_addr, peer_addrs, tx).map_err(|e| anyhow::anyhow!("p2p: {e}"))?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        ctrlc::set_handler(move || shutdown.store(true, Ordering::Relaxed)).ok();
+    }
+
+    let mut pending: Vec<DagBlock> = Vec::new();
+    let mut produced = 0u64;
+    let mut last_mine = Instant::now() - Duration::from_millis(block_interval_ms);
+    let mut last_log = Instant::now();
+
+    tracing::info!(%listen, miner = %miner_pubkey, "blockDAG node started");
+
+    while !shutdown.load(Ordering::Relaxed) {
+        // Receive gossiped blocks.
+        while let Ok(NetMsg::NewBlock(bytes)) = rx.try_recv() {
+            if let Ok(block) = bincode::deserialize::<DagBlock>(&bytes) {
+                pending.push(block);
+            }
+        }
+        // Apply pending blocks, retrying orphans until no further progress.
+        loop {
+            let mut progress = false;
+            let mut still = Vec::new();
+            for block in pending.drain(..) {
+                match chain.accept(block.clone()) {
+                    Ok(()) => progress = true,
+                    Err(e) if e.contains("orphan") => still.push(block),
+                    Err(_) => {} // invalid PoW etc — drop
+                }
+            }
+            pending = still;
+            if !progress {
+                break;
+            }
+        }
+
+        // Mine on the current tips at the configured cadence.
+        if last_mine.elapsed() >= Duration::from_millis(block_interval_ms) {
+            let block = chain.mine(&[]).map_err(|e| anyhow::anyhow!("mine: {e}"))?;
+            let bytes = bincode::serialize(&block).expect("serialize block");
+            network.broadcast(&NetMsg::NewBlock(bytes));
+            produced += 1;
+            last_mine = Instant::now();
+            if blocks != 0 && produced >= blocks {
+                break;
+            }
+        }
+
+        if last_log.elapsed() >= Duration::from_secs(2) {
+            tracing::info!(
+                blocks = chain.block_count(),
+                tips = chain.tips().len(),
+                order = chain.total_order().len(),
+                peers = network.peer_count(),
+                produced,
+                "dag status"
+            );
+            last_log = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let bank = chain.rebuild_state().map_err(|e| anyhow::anyhow!("rebuild: {e}"))?;
+    println!(
+        "stopped: blocks={} tips={} order={} miner_balance={} state_root={}",
+        chain.block_count(),
+        chain.tips().len(),
+        chain.total_order().len(),
+        bank.balance(&miner_pubkey),
+        hex_bytes(&bank.state_root().map_err(|e| anyhow::anyhow!("{e}"))?)
+    );
+    Ok(())
 }
 
 /// Mine a single-node blockDAG using the ported reachability + GHOSTDAG, with
