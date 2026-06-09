@@ -90,13 +90,15 @@ pruning point descends from genesis on a real chain, before adopting its snapsho
    selected ancestor of level ≥ k. Computed at build time from the selected
    parent (`interlink_for_parent`), PoW-committed, and **validated in `accept`**
    so it can't be forged.
-3. **Proof construction (`build_proof_for`).** The NiPoPoW "Prove" shape: process
-   levels high→low; at each level μ collect the level-≥μ chain from P back to a
-   moving anchor, then advance the anchor `m` (the security parameter
-   `PROOF_SECURITY_M`) blocks toward P so lower levels only densify the recent
-   part. Deep history is covered by rare high-level blocks, recent history densely
-   — `O(m·log(work))` headers, interlink-connected and anchored at genesis. Built
-   before pruning (while ancestors exist) and retained.
+3. **Proof construction (`build_proof_for`).** Walk the highest-level interlink
+   back-pointer at each step from P until genesis (empty interlink): each jump is
+   the longest available, so the proof is logarithmic-ish in the work yet always
+   interlink-connected (consecutive headers are linked by the followed pointer)
+   and anchored at genesis. A longer chain yields a longer walk (more high-level
+   blocks ⇒ more certified work), which is what the most-work comparison needs.
+   Built before pruning (while ancestors exist) and retained. (A multi-level
+   "Prove" construction sampling *all* level-μ blocks was tried but left
+   connectivity gaps on long chains; the connected single walk is used instead.)
 4. **Verification (`verify_proof`).** A joiner checks the proof is anchored at its
    own genesis, ends at the claimed origin, every non-genesis header has valid
    PoW, and consecutive headers are interlink/parent-connected; it returns the
@@ -137,13 +139,15 @@ So the specific review risk (hard panic on serialization failure in this path) i
 addressed, while still leaving intentionally non-critical fallbacks to surface via
 logs.
 
-### Remaining refinements (not blocking)
+### Refinements
 
-- **Most-work selection across competing peers.** A joiner currently adopts the
-  first valid proof (fine under one honest peer); comparing proofs from multiple
-  peers by accumulated work (the NiPoPoW "maxchain" rule) hardens against a lone
-  dishonest peer. (Next.)
-- **Multi-prune proof chaining.** A genesis-anchored proof is rebuilt at each
-  prune; once a node has pruned twice, the older ancestors are gone, so the proof
-  anchors at genesis only while built from headers that still reach it. Chaining
-  successive proofs across repeated prunes is a refinement. (Next.)
+- **Most-work selection across competing peers — done.** `import_snapshot`
+  verifies each candidate proof and adopts only the highest-work one (the NiPoPoW
+  "maxchain" rule): a fresh node adopts, a bootstrapped node switches only to a
+  strictly more-work proof, and a node that built/pruned its own chain never
+  adopts. `verify_proof` returns the certified work; proofs anchor at the node's
+  original genesis. Tested by `most_work_proof_wins`.
+- **Multi-prune proof chaining — remaining.** A genesis-anchored proof is rebuilt
+  at each prune; once a node has pruned twice, the older ancestors are gone, so
+  the proof anchors at genesis only while built from headers that still reach it.
+  Chaining successive proofs across repeated prunes is the last refinement.
