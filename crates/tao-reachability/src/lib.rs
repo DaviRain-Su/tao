@@ -23,14 +23,30 @@
 //! insertion + reindex algorithm (`inquirer`/`tree`/`reindex`) is ported on top
 //! of these traits next.
 
+mod extensions;
+pub mod inquirer;
 mod interval;
+mod reindex;
 mod store;
+#[cfg(test)]
+mod tests;
+mod tree;
 
 pub use interval::Interval;
 pub use store::{MemoryReachabilityStore, ReachabilityStore, ReachabilityStoreReader};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+
+/// Performance / safety constants (rusty-kaspa `core/config/constants.rs`).
+pub mod constants {
+    pub mod perf {
+        /// How far behind the tip the reindex root trails.
+        pub const DEFAULT_REINDEX_DEPTH: u64 = 100;
+        /// Slack reserved per chain block below the reindex root (2^14).
+        pub const DEFAULT_REINDEX_SLACK: u64 = 1 << 14;
+    }
+}
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -47,6 +63,11 @@ impl Hash {
 
     pub fn to_bytes(self) -> [u8; 32] {
         self.0
+    }
+
+    /// Is this the `NONE` sentinel (no parent)?
+    pub fn is_none(&self) -> bool {
+        *self == blockhash::NONE
     }
 }
 
@@ -97,3 +118,37 @@ pub enum StoreError {
     #[error("reachability hash already exists: {0}")]
     HashAlreadyExists(Hash),
 }
+
+impl StoreError {
+    pub fn is_key_not_found(&self) -> bool {
+        matches!(self, StoreError::KeyNotFound(_))
+    }
+    pub fn is_already_exists(&self) -> bool {
+        matches!(self, StoreError::HashAlreadyExists(_))
+    }
+}
+
+/// Result alias for store operations.
+pub type StoreResult<T> = std::result::Result<T, StoreError>;
+
+/// Errors from the reachability algorithm.
+#[derive(Debug, thiserror::Error)]
+pub enum ReachabilityError {
+    #[error("data store error")]
+    StoreError(#[from] StoreError),
+    #[error("data overflow error: {0}")]
+    DataOverflow(String),
+    #[error("data inconsistency error")]
+    DataInconsistency,
+    #[error("query is inconsistent")]
+    BadQuery,
+}
+
+impl ReachabilityError {
+    pub fn is_key_not_found(&self) -> bool {
+        matches!(self, ReachabilityError::StoreError(err) if err.is_key_not_found())
+    }
+}
+
+/// Result alias for the reachability algorithm.
+pub type Result<T> = std::result::Result<T, ReachabilityError>;
