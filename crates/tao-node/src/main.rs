@@ -117,6 +117,10 @@ enum Command {
         blocks: u64,
         #[arg(long, default_value_t = 18)]
         k: u16,
+        /// Finality depth: blocks kept beyond the checkpoint before finalized
+        /// transaction bodies are pruned.
+        #[arg(long, default_value_t = 100)]
+        finality_depth: u64,
     },
 }
 
@@ -133,9 +137,16 @@ fn main() -> anyhow::Result<()> {
             matmul_n, matmul_rank, pow_switch_height,
         }),
         Command::DagMine { data_dir, miner, blocks, k } => dag_mine(data_dir, miner, blocks, k),
-        Command::DagRun { data_dir, miner, listen, peers, block_interval_ms, blocks, k } => {
-            dag_run(data_dir, miner, listen, peers, block_interval_ms, blocks, k)
-        }
+        Command::DagRun {
+            data_dir,
+            miner,
+            listen,
+            peers,
+            block_interval_ms,
+            blocks,
+            k,
+            finality_depth,
+        } => dag_run(data_dir, miner, listen, peers, block_interval_ms, blocks, k, finality_depth),
     }
 }
 
@@ -187,6 +198,7 @@ fn dag_open(
 /// the current tips, accept peer blocks (buffering orphans until their parents
 /// arrive), and converge with peers on one GHOSTDAG order.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn dag_run(
     data_dir: PathBuf,
     miner: String,
@@ -195,6 +207,7 @@ fn dag_run(
     block_interval_ms: u64,
     blocks: u64,
     k: u16,
+    finality_depth: u64,
 ) -> anyhow::Result<()> {
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
@@ -202,6 +215,7 @@ fn dag_run(
     use tao_p2p::{NetMsg, Network};
 
     let (mut chain, miner_pubkey) = dag_open(data_dir, &miner, k)?;
+    chain.set_finality_depth(finality_depth);
 
     let listen_addr: SocketAddr = listen.parse().map_err(|e| anyhow::anyhow!("bad --listen: {e}"))?;
     let peer_addrs: Vec<SocketAddr> = peers
@@ -229,6 +243,7 @@ fn dag_run(
     let mut last_request = Instant::now() - Duration::from_secs(1);
     // Fire the first tip request immediately so a fresh node syncs on connect.
     let mut last_tipreq = Instant::now() - Duration::from_secs(10);
+    let mut last_maint = Instant::now();
 
     tracing::info!(%listen, miner = %miner_pubkey, "blockDAG node started");
 
@@ -300,6 +315,18 @@ fn dag_run(
         if last_tipreq.elapsed() >= Duration::from_secs(2) {
             network.broadcast(&NetMsg::GetTips);
             last_tipreq = Instant::now();
+        }
+
+        // Maintenance: advance the virtual state (forming checkpoints) and prune
+        // finalized transaction bodies to bound memory.
+        if last_maint.elapsed() >= Duration::from_secs(5) {
+            let _ = chain.virtual_state();
+            if let Ok(n) = chain.prune_finalized_transactions() {
+                if n > 0 {
+                    tracing::info!(pruned = n, "pruned finalized tx bodies");
+                }
+            }
+            last_maint = Instant::now();
         }
 
         // Mine on the current tips at the configured cadence.

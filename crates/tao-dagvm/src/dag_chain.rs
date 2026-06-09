@@ -66,6 +66,9 @@ pub struct DagChain {
     finality_depth: u64,
     checkpoint: Option<Checkpoint>,
     checkpoint_dir: PathBuf,
+    /// Once finalized transaction bodies are pruned, state can only be rebuilt
+    /// from the checkpoint (not genesis).
+    history_pruned: bool,
 }
 
 /// A finalized state snapshot: the account set after executing the first `len`
@@ -148,6 +151,7 @@ impl DagChain {
             finality_depth: DEFAULT_FINALITY_DEPTH,
             checkpoint: None,
             checkpoint_dir: data_dir.join("checkpoint"),
+            history_pruned: false,
         };
 
         // Replay the log.
@@ -368,6 +372,11 @@ impl DagChain {
     /// always correct (used by [`Self::virtual_state`] as its reorg fallback and
     /// as the cross-check in tests).
     pub fn rebuild_state(&self) -> Result<Bank, BankError> {
+        if self.history_pruned {
+            return Err(BankError::Storage(
+                "history pruned; query state via virtual_state".into(),
+            ));
+        }
         let bank = self.fresh_bank(&self.accounts_dir)?;
         self.replay_blocks(&bank, &self.total_order())?;
         Ok(bank)
@@ -408,6 +417,12 @@ impl DagChain {
                     .map_err(|e| BankError::Storage(e.to_string()))?;
                 self.replay_blocks(&bank, &order[cp_len..])?;
                 bank
+            } else if self.history_pruned {
+                // No matching checkpoint and history is gone — a reorg deeper
+                // than the pruned/finalized point, which must never happen.
+                return Err(BankError::Storage(
+                    "reorg below pruned history (deeper than finality)".into(),
+                ));
             } else {
                 let bank = self.fresh_bank(&self.state_dir)?;
                 self.replay_blocks(&bank, &order)?;
@@ -451,6 +466,48 @@ impl DagChain {
         let last_id = self.executed[target - 1];
         self.checkpoint = Some(Checkpoint { len: target, last_id, accounts });
         Ok(())
+    }
+
+    /// Prune the transaction bodies of finalized blocks (those in the checkpoint
+    /// prefix). Their effects are already captured in the checkpoint snapshot, so
+    /// they are redundant for state; dropping them bounds the dominant memory
+    /// cost. Returns how many blocks' transactions were dropped.
+    ///
+    /// This is consensus-safe: it touches no ordering, difficulty, or GHOSTDAG
+    /// computation — only data already reflected in the snapshot. After it,
+    /// state is queryable solely via [`Self::virtual_state`] (which rebuilds from
+    /// the checkpoint); [`Self::rebuild_state`] (full replay from genesis) errors.
+    ///
+    /// NOTE: headers and the GHOSTDAG engine are retained (DAA samples the
+    /// selected chain over them, and pruning them would change the difficulty
+    /// window and risk diverging from non-pruned peers). Re-anchoring the engine
+    /// below the checkpoint + compacting the durable log + serving sync from the
+    /// pruning point are the heavier follow-ons.
+    pub fn prune_finalized_transactions(&mut self) -> Result<usize, BankError> {
+        let cp_len = match &self.checkpoint {
+            Some(cp) => cp.len,
+            None => return Ok(0),
+        };
+        let prefix: Vec<[u8; 32]> = self.executed[..cp_len].to_vec();
+        let mut pruned = 0;
+        for id in &prefix {
+            if self.block_txs.remove(id).is_some() {
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            self.history_pruned = true;
+            // The cached state may have been built from genesis; force the next
+            // query to rebuild from the checkpoint snapshot instead.
+            self.state = None;
+            self.executed.clear();
+        }
+        Ok(pruned)
+    }
+
+    /// Whether finalized transaction history has been pruned.
+    pub fn is_history_pruned(&self) -> bool {
+        self.history_pruned
     }
 
     /// Reconstruct a stored block by id (for serving peer backfill requests),
@@ -756,6 +813,48 @@ mod tests {
         let v = chain.virtual_state().unwrap().state_root().unwrap();
         let r = chain.rebuild_state().unwrap().state_root().unwrap();
         assert_eq!(v, r, "checkpoint-based rebuild equals full replay");
+    }
+
+    #[test]
+    fn pruning_finalized_txs_preserves_state() {
+        // Dropping the transaction bodies of finalized (pre-checkpoint) blocks
+        // must not change the state: the checkpoint snapshot already reflects
+        // them, so virtual_state rebuilds the same root from the snapshot.
+        let payer = solana_keypair::Keypair::new();
+        let a = solana_keypair::Keypair::new();
+        let miner = Pubkey::new_unique();
+        let mut chain = DagChain::open(
+            dir("prune"),
+            3,
+            easy_target(),
+            miner,
+            1_000_000,
+            vec![(payer.pubkey(), 1_000_000_000)],
+        )
+        .unwrap();
+        chain.set_finality_depth(2);
+        for i in 0..12 {
+            let txs = if i < 2 {
+                vec![transfer(&payer, &a.pubkey(), 50_000_000)]
+            } else {
+                vec![]
+            };
+            chain.mine(&txs).unwrap();
+            chain.virtual_state().unwrap();
+        }
+        assert!(chain.checkpoint.is_some());
+
+        let before = chain.virtual_state().unwrap().state_root().unwrap();
+        let txs_before = chain.block_txs.len();
+        let pruned = chain.prune_finalized_transactions().unwrap();
+        assert!(pruned > 0, "some finalized tx bodies were dropped");
+        assert!(chain.block_txs.len() < txs_before, "block_txs shrank");
+        assert!(chain.is_history_pruned());
+        // Full replay from genesis is no longer possible.
+        assert!(chain.rebuild_state().is_err());
+        // But the snapshot-based virtual state still reproduces the same root.
+        let after = chain.virtual_state().unwrap().state_root().unwrap();
+        assert_eq!(before, after, "state preserved after pruning finalized tx bodies");
     }
 
     #[test]
