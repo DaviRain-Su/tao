@@ -123,7 +123,7 @@ fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult {
         "getBalance" => {
             let pubkey = parse_pubkey(&param_str(params, 0)?)?;
             let lamports = shared
-                .accounts
+                .accounts()
                 .get(&pubkey)
                 .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
                 .map(|a| a.lamports())
@@ -134,7 +134,7 @@ fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult {
         "getAccountInfo" => {
             let pubkey = parse_pubkey(&param_str(params, 0)?)?;
             let value = match shared
-                .accounts
+                .accounts()
                 .get(&pubkey)
                 .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
             {

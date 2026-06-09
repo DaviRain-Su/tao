@@ -259,6 +259,12 @@ impl Bank {
         &self.db
     }
 
+    /// A cloned handle to the account store (for sharing with the RPC thread;
+    /// RocksDB is internally synchronized).
+    pub fn accounts_arc(&self) -> Arc<AccountsDb> {
+        self.db.clone()
+    }
+
     fn build_check_result(
         &self,
         sanitized: &SanitizedTransaction,

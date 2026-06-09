@@ -126,6 +126,13 @@ enum Command {
         /// transaction bodies are pruned.
         #[arg(long, default_value_t = 100)]
         finality_depth: u64,
+        /// Serve the Solana-compatible JSON-RPC (so web3.js / wallets can query
+        /// state and submit transactions that get mined into DAG blocks).
+        #[arg(long)]
+        rpc: bool,
+        /// RPC port (default 8899).
+        #[arg(long)]
+        rpc_port: Option<u16>,
     },
     /// Run the M7b utility-gated matmul-PoUW miner: register a model, mine
     /// model-bound matmul solutions (the work IS a real model layer applied to a
@@ -209,7 +216,9 @@ fn main() -> anyhow::Result<()> {
             blocks,
             k,
             finality_depth,
-        } => dag_run(
+            rpc,
+            rpc_port,
+        } => dag_run(DagRunArgs {
             data_dir,
             miner,
             listen,
@@ -218,7 +227,9 @@ fn main() -> anyhow::Result<()> {
             blocks,
             k,
             finality_depth,
-        ),
+            rpc,
+            rpc_port,
+        }),
         Command::UtilityMine { blocks, n, rank, tiles, requests, out } => {
             utility_mine(blocks, n, rank, tiles, requests, out)
         }
@@ -385,11 +396,7 @@ fn dag_open(
     Ok((chain, miner_pubkey))
 }
 
-/// A networked multi-miner blockDAG node: gossip DAG blocks over TCP, mine on
-/// the current tips, accept peer blocks (buffering orphans until their parents
-/// arrive), and converge with peers on one GHOSTDAG order.
-#[allow(clippy::too_many_arguments)]
-fn dag_run(
+struct DagRunArgs {
     data_dir: PathBuf,
     miner: String,
     listen: String,
@@ -398,11 +405,32 @@ fn dag_run(
     blocks: u64,
     k: u16,
     finality_depth: u64,
-) -> anyhow::Result<()> {
+    rpc: bool,
+    rpc_port: Option<u16>,
+}
+
+/// A networked multi-miner blockDAG node: gossip DAG blocks over TCP, mine on
+/// the current tips (draining the mempool), accept peer blocks (buffering orphans
+/// until their parents arrive), and converge with peers on one GHOSTDAG order.
+/// Optionally serves the Solana-compatible JSON-RPC over the DAG's SVM state.
+fn dag_run(args: DagRunArgs) -> anyhow::Result<()> {
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
     use tao_dagvm::DagBlock;
     use tao_p2p::{InboundMsg, NetMsg, Network};
+
+    let DagRunArgs {
+        data_dir,
+        miner,
+        listen,
+        peers,
+        block_interval_ms,
+        blocks,
+        k,
+        finality_depth,
+        rpc,
+        rpc_port,
+    } = args;
 
     let (mut chain, miner_pubkey) = dag_open(data_dir, &miner, k)?;
     let requested_finality_depth = finality_depth;
@@ -437,6 +465,39 @@ fn dag_run(
         let shutdown = shutdown.clone();
         ctrlc::set_handler(move || shutdown.store(true, Ordering::Relaxed)).ok();
     }
+
+    // RPC state: the DAG node serves Solana-compatible RPC over its SVM virtual
+    // state. The mempool collects sendTransaction'd txs that the miner drains into
+    // blocks; reads (getBalance/getAccountInfo) go to the current virtual state.
+    use crate::shared::Shared;
+    let genesis_hash = chain.total_order().first().copied().unwrap_or([0u8; 32]);
+    let init_accounts = chain
+        .virtual_state()
+        .map_err(|e| anyhow::anyhow!("init virtual state: {e}"))?
+        .accounts_arc();
+    let height0 = chain.total_order().len().saturating_sub(1) as u64;
+    // env_blockhash the DAG SVM executes against; getLatestBlockhash returns it
+    // (the Bank does not enforce blockhash freshness, so any tx referencing it is
+    // accepted).
+    let env_blockhash = [7u8; 32];
+    let shared = Arc::new(Shared::new(init_accounts, genesis_hash, height0, env_blockhash, None));
+    let rpc_thread = if rpc {
+        let port = rpc_port.unwrap_or(8899);
+        let addr: SocketAddr = format!("0.0.0.0:{port}")
+            .parse()
+            .map_err(|e| anyhow::anyhow!("bad rpc bind: {e}"))?;
+        let shared = shared.clone();
+        let shutdown = shutdown.clone();
+        tracing::info!(%addr, "serving Solana-compatible JSON-RPC over the blockDAG");
+        Some(std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            if let Err(e) = rt.block_on(rpc::serve(shared, addr, shutdown)) {
+                tracing::error!(error = %e, "rpc server error");
+            }
+        }))
+    } else {
+        None
+    };
 
     let mut pending: Vec<DagBlock> = Vec::new();
     let mut produced = 0u64;
@@ -569,12 +630,28 @@ fn dag_run(
             last_maint = Instant::now();
         }
 
-        // Mine on the current tips at the configured cadence.
+        // Mine on the current tips at the configured cadence, including any
+        // mempool transactions (from RPC sendTransaction).
         if last_mine.elapsed() >= Duration::from_millis(block_interval_ms) {
-            let block = chain.mine(&[]).map_err(|e| anyhow::anyhow!("mine: {e}"))?;
+            let txs = shared.drain_mempool();
+            let block = chain.mine(&txs).map_err(|e| anyhow::anyhow!("mine: {e}"))?;
             let bytes = bincode::serialize(&block).expect("serialize block");
             network.broadcast(&NetMsg::NewBlock(bytes));
             produced += 1;
+
+            // Refresh RPC state: re-point reads at the new virtual state, advance
+            // the head, and confirm the included transactions.
+            match chain.virtual_state() {
+                Ok(bank) => shared.set_accounts(bank.accounts_arc()),
+                Err(e) => tracing::warn!(error = %e, "virtual state after mine"),
+            }
+            shared.advance(chain.total_order().len().saturating_sub(1) as u64, env_blockhash);
+            for tx in &txs {
+                if let Some(sig) = tx.signatures.first().and_then(|s| <[u8; 64]>::try_from(s.as_ref()).ok()) {
+                    shared.confirm(sig, None);
+                }
+            }
+
             last_mine = Instant::now();
             if blocks != 0 && produced >= blocks {
                 break;
@@ -612,6 +689,9 @@ fn dag_run(
         balance,
         hex_bytes(&root)
     );
+    if let Some(t) = rpc_thread {
+        let _ = t.join();
+    }
     Ok(())
 }
 

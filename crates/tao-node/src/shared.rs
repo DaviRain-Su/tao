@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use solana_transaction::Transaction;
 use tao_database::AccountsDb;
@@ -18,8 +18,10 @@ pub type SigResult = Option<String>;
 
 /// Cross-thread node state.
 pub struct Shared {
-    /// The account store (also held by the miner's Bank — same instance).
-    pub accounts: Arc<AccountsDb>,
+    /// The current account store the RPC reads. The linear miner shares one
+    /// instance with its Bank; the DAG node re-points it after each block (its
+    /// virtual state may rebuild the store). RocksDB is internally synchronized.
+    accounts: RwLock<Arc<AccountsDb>>,
     /// Genesis block id (for `getGenesisHash`).
     pub genesis_hash: [u8; 32],
     /// Faucet keypair secret (64 bytes) — enables `requestAirdrop` when set.
@@ -42,7 +44,7 @@ impl Shared {
         faucet: Option<[u8; 64]>,
     ) -> Self {
         Self {
-            accounts,
+            accounts: RwLock::new(accounts),
             genesis_hash,
             faucet,
             slot: AtomicU64::new(slot),
@@ -63,6 +65,17 @@ impl Shared {
         if let Some(net) = self.network.get() {
             net.broadcast(&NetMsg::NewTx(raw));
         }
+    }
+
+    /// The current account store (a cheap Arc clone; RocksDB-synchronized).
+    pub fn accounts(&self) -> Arc<AccountsDb> {
+        self.accounts.read().unwrap().clone()
+    }
+
+    /// Re-point the account store (the DAG node calls this after each block, since
+    /// its virtual state may have rebuilt the store on a reorg).
+    pub fn set_accounts(&self, accounts: Arc<AccountsDb>) {
+        *self.accounts.write().unwrap() = accounts;
     }
 
     pub fn slot(&self) -> u64 {
