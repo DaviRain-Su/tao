@@ -13,6 +13,6 @@ pub mod bank;
 pub mod blockhash_queue;
 pub mod genesis;
 
-pub use bank::{Bank, BankError, TxOutcome, LAMPORTS_PER_SIGNATURE};
+pub use bank::{Bank, BankError, BlockExecution, TxOutcome, LAMPORTS_PER_SIGNATURE};
 pub use blockhash_queue::BlockhashQueue;
 pub use genesis::{load_allocations, GenesisLoad};

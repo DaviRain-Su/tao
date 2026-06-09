@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::sync::{Arc, RwLock};
 
-use solana_account::{Account, AccountSharedData, ReadableAccount};
+use solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount};
 use solana_clock::{Clock, Epoch, Slot};
 use solana_compute_budget::compute_budget_limits::ComputeBudgetLimits;
 use solana_fee_structure::FeeDetails;
@@ -298,6 +298,78 @@ impl Bank {
     pub fn balance(&self, pubkey: &Pubkey) -> u64 {
         self.db.get(pubkey).ok().flatten().map(|a| a.lamports()).unwrap_or(0)
     }
+
+    /// Credit `lamports` to a System-owned account, creating it if absent.
+    /// Used for the coinbase (block reward + collected fees → miner).
+    fn credit(&self, pubkey: &Pubkey, lamports: u64) -> Result<(), BankError> {
+        if lamports == 0 {
+            return Ok(());
+        }
+        let mut account = self
+            .db
+            .get(pubkey)
+            .map_err(|e| BankError::Storage(e.to_string()))?
+            .unwrap_or_else(|| {
+                AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id())
+            });
+        account.set_lamports(account.lamports().saturating_add(lamports));
+        self.db.set(pubkey, &account).map_err(|e| BankError::Storage(e.to_string()))
+    }
+
+    /// Execute a block's transactions in order, pay the coinbase
+    /// (`block_reward` newly minted + all collected fees) to `miner`, and return
+    /// the resulting state. Transactions are applied sequentially so each sees
+    /// the prior writes. Transactions that fail to even process (bad signature)
+    /// are skipped.
+    pub fn execute_block(
+        &self,
+        transactions: &[Transaction],
+        blockhash: Hash,
+        miner: &Pubkey,
+        block_reward: u64,
+    ) -> Result<BlockExecution, BankError> {
+        let mut fees = 0u64;
+        let mut executed = 0usize;
+        let mut failed = 0usize;
+
+        for tx in transactions {
+            match self.execute_transaction(tx, blockhash) {
+                Ok(outcome) => {
+                    fees = fees.saturating_add(outcome.fee);
+                    if outcome.succeeded {
+                        executed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(error = %e, "transaction rejected before processing");
+                }
+            }
+        }
+
+        // Coinbase: newly minted reward plus recycled fees go to the miner.
+        self.credit(miner, block_reward.saturating_add(fees))?;
+
+        let state_root = self.state_root()?;
+        Ok(BlockExecution { state_root, fees, reward: block_reward, executed, failed })
+    }
+}
+
+/// Summary of executing one block.
+#[derive(Debug, Clone)]
+pub struct BlockExecution {
+    /// Account-set state root after execution + coinbase.
+    pub state_root: [u8; 32],
+    /// Total fees collected from transactions.
+    pub fees: u64,
+    /// Block reward minted to the miner.
+    pub reward: u64,
+    /// Number of transactions that committed successfully.
+    pub executed: usize,
+    /// Number of transactions that failed or were rejected.
+    pub failed: usize,
 }
 
 #[cfg(test)]
@@ -349,6 +421,42 @@ mod tests {
             bank.balance(&payer.pubkey()),
             1_000_000_000 - amount - LAMPORTS_PER_SIGNATURE
         );
+    }
+
+    #[test]
+    fn execute_block_pays_coinbase_and_is_deterministic() {
+        let payer = Keypair::new();
+        let recipient = Keypair::new();
+        let miner = Pubkey::new_unique();
+        let blockhash = Hash::new_unique();
+        let amount = 5_000_000u64;
+        let reward = 1_000_000_000u64;
+        let ix = solana_system_interface::instruction::transfer(
+            &payer.pubkey(),
+            &recipient.pubkey(),
+            amount,
+        );
+        let tx =
+            Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], blockhash);
+
+        let run = |tag: &str| {
+            let db = tmp_db(tag);
+            fund(&db, &payer.pubkey(), 1_000_000_000);
+            let bank = Bank::new(db.clone(), 1);
+            let exec = bank.execute_block(&[tx.clone()], blockhash, &miner, reward).unwrap();
+            (exec, bank.balance(&miner), bank.balance(&recipient.pubkey()))
+        };
+
+        let (exec_a, miner_a, recip_a) = run("blk_a");
+        assert_eq!(exec_a.executed, 1);
+        assert_eq!(exec_a.fees, LAMPORTS_PER_SIGNATURE);
+        assert_eq!(recip_a, amount);
+        // miner gets the newly-minted reward plus recycled fees.
+        assert_eq!(miner_a, reward + LAMPORTS_PER_SIGNATURE);
+
+        let (exec_b, miner_b, _) = run("blk_b");
+        assert_eq!(exec_a.state_root, exec_b.state_root, "non-deterministic state root");
+        assert_eq!(miner_a, miner_b);
     }
 
     #[test]

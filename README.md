@@ -52,8 +52,17 @@ cargo run -p tao-node -- run --mine \
   --miner 11111111111111111111111111111111 --data-dir .tao --blocks 50
 ```
 
-Next: **M2** — AccountsDB + `solana-svm` execution (the Solana-compatible
-execution layer), with RocksDB state storage.
+- **M2 — accounts + SVM execution 🚧 (runtime done)** RocksDB `AccountsDb`
+  with deterministic `state_root`; `BlockhashQueue`; genesis allocation loader;
+  and a `Bank` that **executes real Solana transactions through the embedded
+  Agave SVM** (`solana-svm` 4.0), with coinbase (block reward + recycled fees)
+  and block-level execution. Proven: a System transfer runs unchanged
+  (rent-exemption enforced) and two independent banks reach an identical state
+  root. 30 tests. Remaining: wire block execution into the miner/validator
+  pipeline (state_root in the header).
+
+Next: finish M2 node wiring, then **M3** (deploy SPL Token + run an Anchor
+program) and **M4** (Solana-compatible JSON-RPC for Phantom / web3.js).
 
 ## License
 
