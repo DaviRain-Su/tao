@@ -3832,6 +3832,7 @@ dependencies = [
  "tao-consensus",
  "tao-core",
  "tao-database",
+ "tao-p2p",
  "tao-runtime",
  "tokio",
  "tracing",
@@ -3841,7 +3842,10 @@ dependencies = [
 name = "tao-p2p"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "serde",
  "tao-core",
+ "tracing",
 ]
 
 [[package]]

@@ -6,10 +6,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use solana_transaction::Transaction;
 use tao_database::AccountsDb;
+use tao_p2p::{NetMsg, Network};
 
 /// Confirmed transaction status: `None` = success, `Some(err)` = failed.
 pub type SigResult = Option<String>;
@@ -25,6 +26,8 @@ pub struct Shared {
     mempool: Mutex<Vec<Transaction>>,
     /// Confirmed signatures → result. Presence means "confirmed".
     sig_status: Mutex<HashMap<[u8; 64], SigResult>>,
+    /// Gossip network handle (attached after construction).
+    network: OnceLock<Network>,
 }
 
 impl Shared {
@@ -41,6 +44,19 @@ impl Shared {
             latest_blockhash: Mutex::new(latest_blockhash),
             mempool: Mutex::new(Vec::new()),
             sig_status: Mutex::new(HashMap::new()),
+            network: OnceLock::new(),
+        }
+    }
+
+    /// Attach the gossip network so the RPC can relay submitted transactions.
+    pub fn attach_network(&self, network: Network) {
+        let _ = self.network.set(network);
+    }
+
+    /// Relay a raw (wire-format) transaction to peers, if networked.
+    pub fn gossip_tx(&self, raw: Vec<u8>) {
+        if let Some(net) = self.network.get() {
+            net.broadcast(&NetMsg::NewTx(raw));
         }
     }
 

@@ -56,6 +56,12 @@ enum Command {
         /// RPC port (default from config, usually 8899).
         #[arg(long)]
         rpc_port: Option<u16>,
+        /// P2P listen address, e.g. 127.0.0.1:9001 (enables networking).
+        #[arg(long)]
+        listen: Option<String>,
+        /// Comma-separated bootstrap peer addresses to dial.
+        #[arg(long)]
+        peers: Option<String>,
     },
 }
 
@@ -64,8 +70,8 @@ fn main() -> anyhow::Result<()> {
     logging::init(&cli.log);
     match cli.command {
         Command::Init { data_dir } => init(data_dir),
-        Command::Run { config, data_dir, mine, miner, blocks, rpc, rpc_port } => {
-            run(config, data_dir, mine, miner, blocks, rpc, rpc_port)
+        Command::Run { config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers } => {
+            run(RunArgs { config, data_dir, mine, miner, blocks, rpc, rpc_port, listen, peers })
         }
     }
 }
@@ -80,38 +86,46 @@ fn init(data_dir: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(
-    config_path: Option<PathBuf>,
-    data_dir_override: Option<PathBuf>,
+struct RunArgs {
+    config: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     mine: bool,
-    miner_arg: Option<String>,
+    miner: Option<String>,
     blocks: u64,
     rpc: bool,
     rpc_port: Option<u16>,
-) -> anyhow::Result<()> {
-    let config = match config_path {
+    listen: Option<String>,
+    peers: Option<String>,
+}
+
+fn run(args: RunArgs) -> anyhow::Result<()> {
+    let config = match args.config {
         Some(path) => NodeConfig::load(path)?,
         None => NodeConfig::default(),
     };
-    let data_dir = data_dir_override.unwrap_or_else(|| config.data_dir.clone());
+    let data_dir = args.data_dir.unwrap_or_else(|| config.data_dir.clone());
     let genesis_path = data_dir.join("genesis.toml");
     let genesis =
         if genesis_path.exists() { GenesisConfig::load(&genesis_path)? } else { GenesisConfig::devnet() };
 
-    if !mine {
+    if !args.mine && !args.rpc && args.listen.is_none() {
         println!(
-            "tao-node {} — network '{}'. Pass --mine [--rpc] to run.",
+            "tao-node {} — network '{}'. Pass --mine and/or --rpc / --listen ADDR.",
             tao_core::VERSION, config.network
         );
         return Ok(());
     }
 
-    let miner_str = miner_arg
-        .or_else(|| config.miner.reward_address.clone())
-        .ok_or_else(|| anyhow::anyhow!("--mine requires --miner <PUBKEY> or miner.reward_address"))?;
-    let miner = Pubkey::from_str(&miner_str)
-        .map_err(|e| anyhow::anyhow!("invalid miner address '{miner_str}': {e}"))?;
+    // Miner reward address (only required when this node produces blocks).
+    let miner_pubkey = if args.mine {
+        let s = args
+            .miner
+            .or_else(|| config.miner.reward_address.clone())
+            .ok_or_else(|| anyhow::anyhow!("--mine requires --miner <PUBKEY> or miner.reward_address"))?;
+        Pubkey::from_str(&s).map_err(|e| anyhow::anyhow!("invalid miner address '{s}': {e}"))?
+    } else {
+        Pubkey::default()
+    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -119,30 +133,57 @@ fn run(
         ctrlc::set_handler(move || shutdown.store(true, Ordering::Relaxed)).ok();
     }
 
-    let (miner_loop, shared) =
-        prepare(MineOptions { data_dir, genesis, miner, blocks })?;
+    let (miner_loop, shared) = prepare(MineOptions {
+        data_dir,
+        genesis,
+        miner: miner_pubkey,
+        blocks: args.blocks,
+        mine: args.mine,
+    })?;
 
-    if rpc {
-        let port = rpc_port.unwrap_or(config.rpc.port);
+    // P2P networking.
+    let (network, inbound_rx) = if let Some(listen_str) = args.listen {
+        let listen_addr: SocketAddr =
+            listen_str.parse().map_err(|e| anyhow::anyhow!("bad --listen address: {e}"))?;
+        let peers: Vec<SocketAddr> = args
+            .peers
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<SocketAddr>())
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("bad --peers address: {e}"))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let net = tao_p2p::Network::start(listen_addr, peers, tx)
+            .map_err(|e| anyhow::anyhow!("p2p start: {e}"))?;
+        shared.attach_network(net.clone());
+        (Some(net), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // RPC server in its own thread + runtime; the node loop runs on main.
+    let rpc_thread = if args.rpc {
+        let port = args.rpc_port.unwrap_or(config.rpc.port);
         let addr: SocketAddr = format!("{}:{}", config.rpc.bind, port)
             .parse()
             .map_err(|e| anyhow::anyhow!("bad rpc bind address: {e}"))?;
-        // RPC server runs in its own thread with a tokio runtime; the miner
-        // runs on the main thread (no Send requirement on the Bank).
-        let rpc_thread = {
-            let shared = shared.clone();
-            let shutdown = shutdown.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-                if let Err(e) = rt.block_on(rpc::serve(shared, addr, shutdown)) {
-                    tracing::error!(error = %e, "rpc server error");
-                }
-            })
-        };
-        miner_loop.run(shared, shutdown)?;
-        let _ = rpc_thread.join();
+        let shared = shared.clone();
+        let shutdown = shutdown.clone();
+        Some(std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            if let Err(e) = rt.block_on(rpc::serve(shared, addr, shutdown)) {
+                tracing::error!(error = %e, "rpc server error");
+            }
+        }))
     } else {
-        miner_loop.run(shared, shutdown)?;
+        None
+    };
+
+    miner_loop.run(shared, shutdown, network, inbound_rx)?;
+    if let Some(t) = rpc_thread {
+        let _ = t.join();
     }
     Ok(())
 }

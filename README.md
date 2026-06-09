@@ -91,8 +91,24 @@ cargo run -p tao-node -- run --mine --rpc \
   --miner So11111111111111111111111111111111111111112 --data-dir .tao
 ```
 
-Next: **M5** (P2P networking — multi-node block/tx propagation + IBD) and
-**M6** (CLI wallet + faucet + devnet).
+- **M5 — P2P networking ✓** A minimal TCP gossip layer (`tao-p2p`): nodes
+  listen + dial bootstrap peers and relay `NewBlock` / `NewTx`. The node loop
+  applies inbound peer blocks (validate PoW/difficulty → execute → verify
+  state_root) and follower nodes track the miner; transactions submitted to any
+  node's RPC gossip to the miner. **Verified with a 3-node testnet** (1 miner +
+  2 followers): all nodes stayed at the same height, and a transfer submitted to
+  a *follower's* web3.js RPC propagated to the miner, was mined, and the
+  recipient balance was identical on all three nodes. (Star topology + single
+  miner sidesteps reorgs; libp2p + IBD + multi-miner are future work.)
+
+```sh
+# miner
+tao-node run --mine --miner <PUBKEY> --data-dir n1 --listen 127.0.0.1:9001 --rpc --rpc-port 8899
+# follower
+tao-node run --data-dir n2 --listen 127.0.0.1:9002 --peers 127.0.0.1:9001 --rpc --rpc-port 8900
+```
+
+Next: **M6** (CLI wallet + faucet + reproducible devnet).
 
 ## License
 

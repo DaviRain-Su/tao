@@ -170,6 +170,7 @@ fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult {
                 .ok_or((INVALID_PARAMS, "transaction has no signature".into()))?;
             let sig_b58 = bs58::encode(sig.as_ref()).into_string();
             shared.submit(tx);
+            shared.gossip_tx(raw); // relay to peers so the miner (any node) sees it
             Ok(json!(sig_b58))
         }
 

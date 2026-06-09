@@ -8,11 +8,11 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
-use primitive_types::U256;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use tao_consensus::{
@@ -21,6 +21,7 @@ use tao_consensus::{
 };
 use tao_core::{genesis::GenesisConfig, Hash};
 use tao_database::{AccountsDb, BlockLog};
+use tao_p2p::{NetMsg, Network};
 use tao_runtime::{load_allocations, Bank};
 
 use crate::shared::Shared;
@@ -34,6 +35,8 @@ pub struct MineOptions {
     pub miner: Pubkey,
     /// Number of blocks to mine before returning. `0` = until interrupted.
     pub blocks: u64,
+    /// Whether this node produces blocks (a follower sets this false).
+    pub mine: bool,
 }
 
 /// Block reward at `height` per the genesis emission schedule (halving).
@@ -69,6 +72,7 @@ pub struct Miner {
     genesis: GenesisConfig,
     miner: Pubkey,
     blocks: u64,
+    mine: bool,
 }
 
 /// Build chain + account state (replaying & re-executing the log) and the
@@ -123,105 +127,173 @@ pub fn prepare(opts: MineOptions) -> anyhow::Result<(Miner, Arc<Shared>)> {
         genesis: opts.genesis,
         miner: opts.miner,
         blocks: opts.blocks,
+        mine: opts.mine,
     };
     Ok((miner, shared))
 }
 
 impl Miner {
-    /// Run the mining loop until `blocks` are produced or `shutdown` is set.
-    pub fn run(mut self, shared: Arc<Shared>, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
-        let pow = Blake3Pow;
+    /// Run the node loop until `blocks` are produced (miner) or `shutdown` is
+    /// set. Applies inbound gossip (peer blocks + transactions) every iteration;
+    /// a miner also produces a block each iteration, a follower idles.
+    pub fn run(
+        mut self,
+        shared: Arc<Shared>,
+        shutdown: Arc<AtomicBool>,
+        network: Option<Network>,
+        inbound: Option<Receiver<NetMsg>>,
+    ) -> anyhow::Result<()> {
+        let mode = if self.mine { "miner" } else { "follower" };
         tracing::info!(
             network = %self.genesis.network,
-            miner = %self.miner,
+            mode,
             start_height = self.chain.height(),
-            "starting CPU miner (blake3 PoW + SVM execution)"
+            "node starting (blake3 PoW + SVM execution)"
         );
 
         let mut produced = 0u64;
         let mut last_block_time = unix_now();
 
         while !shutdown.load(Ordering::Relaxed) {
-            if self.blocks != 0 && produced >= self.blocks {
+            if self.mine && self.blocks != 0 && produced >= self.blocks {
                 break;
             }
 
-            let height = self.chain.height() + 1;
-            let reward = emission(&self.genesis, height);
-            let parent_hash = Hash::new_from_array(self.chain.tip_id());
-
-            // Pull pending transactions and execute the block (coinbase + txs).
-            let txs = shared.drain_mempool();
-            let serialized: Vec<Vec<u8>> =
-                txs.iter().map(|t| bincode::serialize(t).expect("tx serialize")).collect();
-            let exec = self.bank.execute_block(&txs, parent_hash, &self.miner, reward)?;
-
-            let mut header = self.chain.build_candidate(self.miner, unix_now(), &serialized);
-            header.state_root = Hash::new_from_array(exec.state_root);
-
-            let grind_start = Instant::now();
-            let mut total_hashes = 0u64;
-            let solved = loop {
-                match grind(&mut header, &pow, GRIND_BATCH) {
-                    GrindResult::Found { hashes } => {
-                        total_hashes += hashes;
-                        break true;
-                    }
-                    GrindResult::Exhausted { hashes } => {
-                        total_hashes += hashes;
-                        if shutdown.load(Ordering::Relaxed) {
-                            break false;
+            // Apply inbound gossip.
+            let mut did_work = false;
+            if let Some(rx) = &inbound {
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        NetMsg::NewBlock(bytes) => {
+                            self.apply_peer_block(&bytes, &shared)?;
+                            did_work = true;
                         }
-                        header.timestamp = unix_now();
+                        NetMsg::NewTx(bytes) => {
+                            if let Ok(tx) = bincode::deserialize::<Transaction>(&bytes) {
+                                shared.submit(tx);
+                            }
+                        }
                     }
                 }
-            };
-            if !solved {
-                break;
             }
 
-            let block = Block::new(header.clone(), serialized);
-            self.log
-                .append(&bincode::serialize(&block).expect("block serialize"))
-                .context("append block")?;
-            let status = self
-                .chain
-                .add_header(header.clone())
-                .map_err(|e| anyhow!("self-mined block rejected: {e}"))?;
-
-            // Confirm signatures for the included transactions.
-            for (tx, outcome) in txs.iter().zip(exec.outcomes.iter()) {
-                if let Some(sig) = signature_bytes(tx) {
-                    shared.confirm(sig, outcome.error.clone());
-                }
+            if self.mine {
+                self.mine_one(&shared, network.as_ref(), &mut produced, &mut last_block_time)?;
+            } else if !did_work {
+                std::thread::sleep(Duration::from_millis(50));
             }
-            shared.advance(height, self.chain.tip_id());
-
-            let now = unix_now();
-            let solvetime = now - last_block_time;
-            last_block_time = now;
-            produced += 1;
-
-            let hps = total_hashes as f64 / grind_start.elapsed().as_secs_f64().max(1e-9);
-            tracing::info!(
-                height = header.height,
-                txs = txs.len(),
-                solvetime_s = solvetime,
-                zero_bits = leading_zero_bits(&header.target),
-                miner_balance = self.bank.balance(&self.miner),
-                hashrate_hs = format_args!("{hps:.0}"),
-                cumulative_work = %work_human(self.chain.tip_work()),
-                status = ?status_label(&status),
-                "mined block"
-            );
         }
 
+        tracing::info!(height = self.chain.height(), produced, "node stopped");
+        Ok(())
+    }
+
+    /// Produce one block: drain mempool, execute, mine PoW, persist, broadcast.
+    fn mine_one(
+        &mut self,
+        shared: &Arc<Shared>,
+        network: Option<&Network>,
+        produced: &mut u64,
+        last_block_time: &mut i64,
+    ) -> anyhow::Result<()> {
+        let pow = Blake3Pow;
+        let height = self.chain.height() + 1;
+        let reward = emission(&self.genesis, height);
+        let parent_hash = Hash::new_from_array(self.chain.tip_id());
+
+        let txs = shared.drain_mempool();
+        let serialized: Vec<Vec<u8>> =
+            txs.iter().map(|t| bincode::serialize(t).expect("tx serialize")).collect();
+        let exec = self.bank.execute_block(&txs, parent_hash, &self.miner, reward)?;
+
+        let mut header = self.chain.build_candidate(self.miner, unix_now(), &serialized);
+        header.state_root = Hash::new_from_array(exec.state_root);
+
+        let grind_start = Instant::now();
+        let mut total_hashes = 0u64;
+        loop {
+            match grind(&mut header, &pow, GRIND_BATCH) {
+                GrindResult::Found { hashes } => {
+                    total_hashes += hashes;
+                    break;
+                }
+                GrindResult::Exhausted { hashes } => {
+                    total_hashes += hashes;
+                    header.timestamp = unix_now();
+                }
+            }
+        }
+
+        let block = Block::new(header.clone(), serialized);
+        let block_bytes = bincode::serialize(&block).expect("block serialize");
+        self.log.append(&block_bytes).context("append block")?;
+        let status = self
+            .chain
+            .add_header(header.clone())
+            .map_err(|e| anyhow!("self-mined block rejected: {e}"))?;
+
+        for (tx, outcome) in txs.iter().zip(exec.outcomes.iter()) {
+            if let Some(sig) = signature_bytes(tx) {
+                shared.confirm(sig, outcome.error.clone());
+            }
+        }
+        shared.advance(height, self.chain.tip_id());
+        if let Some(net) = network {
+            net.broadcast(&NetMsg::NewBlock(block_bytes));
+        }
+
+        let now = unix_now();
+        let solvetime = now - *last_block_time;
+        *last_block_time = now;
+        *produced += 1;
+
+        let hps = total_hashes as f64 / grind_start.elapsed().as_secs_f64().max(1e-9);
         tracing::info!(
-            height = self.chain.height(),
-            produced,
+            height = header.height,
+            txs = txs.len(),
+            solvetime_s = solvetime,
+            zero_bits = leading_zero_bits(&header.target),
             miner_balance = self.bank.balance(&self.miner),
-            "miner stopped"
+            hashrate_hs = format_args!("{hps:.0}"),
+            peers = network.map(|n| n.peer_count()).unwrap_or(0),
+            status = ?status_label(&status),
+            "mined block"
         );
+        Ok(())
+    }
+
+    /// Validate, execute, and apply a block received from a peer.
+    fn apply_peer_block(&mut self, bytes: &[u8], shared: &Arc<Shared>) -> anyhow::Result<()> {
+        let block: Block =
+            bincode::deserialize(bytes).map_err(|e| anyhow!("decode peer block: {e}"))?;
+        let id = block.id();
+        if self.chain.contains(&id) {
+            return Ok(());
+        }
+        let height = block.header.height;
+        let parent_hash = block.header.prev_hash.clone();
+        let block_miner = block.header.miner;
+        let expected = block.header.state_root.to_bytes();
+        let reward = emission(&self.genesis, height);
+        let txs = decode_txs(&block.transactions)?;
+
+        if let Err(e) = self.chain.add_header(block.header) {
+            tracing::warn!(height, error = %e, "rejected peer block (orphan/invalid)");
+            return Ok(());
+        }
+        let exec = self.bank.execute_block(&txs, parent_hash, &block_miner, reward)?;
+        if exec.state_root != expected {
+            tracing::error!(height, "peer block state-root mismatch");
+            return Ok(());
+        }
+        self.log.append(bytes).context("append peer block")?;
+        for (tx, outcome) in txs.iter().zip(exec.outcomes.iter()) {
+            if let Some(sig) = signature_bytes(tx) {
+                shared.confirm(sig, outcome.error.clone());
+            }
+        }
+        shared.advance(height, self.chain.tip_id());
+        tracing::info!(height, txs = txs.len(), "applied peer block");
         Ok(())
     }
 }
@@ -249,12 +321,4 @@ fn leading_zero_bits(bytes: &[u8; 32]) -> u32 {
 
 fn unix_now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-}
-
-fn work_human(work: U256) -> String {
-    if work <= U256::from(u128::MAX) {
-        work.as_u128().to_string()
-    } else {
-        format!("0x{work:x}")
-    }
 }
