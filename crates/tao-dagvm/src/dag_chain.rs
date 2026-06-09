@@ -92,11 +92,28 @@ pub struct DagChain {
     accounts_dir: PathBuf,
     allocations: Vec<(Pubkey, u64)>,
     /// Cached "virtual" state and the exact block order it reflects, for
-    /// incremental replay (append-only fast path; reorg ⇒ full rebuild).
+    /// incremental replay (append-only fast path; reorg ⇒ rebuild from the
+    /// finalized checkpoint, or genesis if none).
     state: Option<Bank>,
     state_dir: PathBuf,
     executed: Vec<[u8; 32]>,
+    /// Finalized state snapshot: a reorg rebuilds from here instead of genesis,
+    /// bounding the work to the post-checkpoint suffix. `0` disables it.
+    finality_depth: u64,
+    checkpoint: Option<Checkpoint>,
+    checkpoint_dir: PathBuf,
 }
+
+/// A finalized state snapshot: the account set after executing the first `len`
+/// blocks of the total order (whose last block is `last_id`).
+struct Checkpoint {
+    len: usize,
+    last_id: [u8; 32],
+    accounts: Vec<(Pubkey, AccountSharedData)>,
+}
+
+/// Blocks kept beyond the checkpoint before it advances (finality margin).
+const DEFAULT_FINALITY_DEPTH: u64 = 100;
 
 impl DagChain {
     /// Open (or create) a DAG chain under `data_dir` with **fixed** difficulty.
@@ -163,6 +180,9 @@ impl DagChain {
             state: None,
             state_dir: data_dir.join("state"),
             executed: Vec::new(),
+            finality_depth: DEFAULT_FINALITY_DEPTH,
+            checkpoint: None,
+            checkpoint_dir: data_dir.join("checkpoint"),
         };
 
         // Replay the log.
@@ -330,17 +350,30 @@ impl DagChain {
         self.engine.total_order().into_iter().map(|h| h.to_bytes()).collect()
     }
 
-    /// A fresh `Bank` over a wiped account store at `dir`, seeded with the
-    /// genesis allocations (the state *before* any block executes).
-    fn fresh_bank(&self, dir: &Path) -> Result<Bank, BankError> {
+    /// Set the finality depth (blocks kept beyond the checkpoint). `0` disables
+    /// checkpointing (reorgs then always rebuild from genesis).
+    pub fn set_finality_depth(&mut self, depth: u64) {
+        self.finality_depth = depth;
+    }
+
+    /// A fresh `Bank` over a wiped account store at `dir`. When `seed_genesis`,
+    /// it is seeded with the genesis allocations (state before any block); when
+    /// false it starts empty (used for restoring a checkpoint snapshot).
+    fn open_bank(&self, dir: &Path, seed_genesis: bool) -> Result<Bank, BankError> {
         let _ = std::fs::remove_dir_all(dir);
         let db = Arc::new(AccountsDb::open(dir).map_err(|e| BankError::Storage(e.to_string()))?);
-        let system = solana_sdk_ids::system_program::id();
-        for (pubkey, lamports) in &self.allocations {
-            db.set(pubkey, &AccountSharedData::new(*lamports, 0, &system))
-                .map_err(|e| BankError::Storage(e.to_string()))?;
+        if seed_genesis {
+            let system = solana_sdk_ids::system_program::id();
+            for (pubkey, lamports) in &self.allocations {
+                db.set(pubkey, &AccountSharedData::new(*lamports, 0, &system))
+                    .map_err(|e| BankError::Storage(e.to_string()))?;
+            }
         }
         Ok(Bank::new(db, 0))
+    }
+
+    fn fresh_bank(&self, dir: &Path) -> Result<Bank, BankError> {
+        self.open_bank(dir, true)
     }
 
     /// Execute the given block ids (in order) through `bank`: each non-genesis
@@ -392,15 +425,66 @@ impl DagChain {
             self.replay_blocks(&bank, &order[start..])?;
             self.state = Some(bank);
         } else {
-            // Drop the cached Bank first so its RocksDB releases state_dir
-            // before fresh_bank wipes and recreates it.
+            // Reorg (or first call): rebuild. Drop the cached Bank first so its
+            // RocksDB releases state_dir before we wipe and recreate it.
             self.state = None;
-            let bank = self.fresh_bank(&self.state_dir)?;
-            self.replay_blocks(&bank, &order)?;
+            // If a finalized checkpoint still matches the new order, rebuild from
+            // it (replay only the post-checkpoint suffix) instead of from genesis.
+            let from_checkpoint = match &self.checkpoint {
+                Some(cp) if order.len() >= cp.len && order[cp.len - 1] == cp.last_id => Some(cp.len),
+                _ => None,
+            };
+            let bank = if let Some(cp_len) = from_checkpoint {
+                let cp = self.checkpoint.as_ref().expect("matched above");
+                let bank = self.open_bank(&self.state_dir, false)?;
+                bank.accounts()
+                    .commit(cp.accounts.iter().cloned())
+                    .map_err(|e| BankError::Storage(e.to_string()))?;
+                self.replay_blocks(&bank, &order[cp_len..])?;
+                bank
+            } else {
+                let bank = self.fresh_bank(&self.state_dir)?;
+                self.replay_blocks(&bank, &order)?;
+                bank
+            };
             self.state = Some(bank);
         }
         self.executed = order;
+        self.maybe_advance_checkpoint()?;
         Ok(self.state.as_ref().expect("set above"))
+    }
+
+    /// Advance the finalized checkpoint once enough blocks have accumulated
+    /// beyond it. The new snapshot is computed from the previous checkpoint (or
+    /// genesis) by replaying only the blocks between them — bounded work.
+    fn maybe_advance_checkpoint(&mut self) -> Result<(), BankError> {
+        let fd = self.finality_depth as usize;
+        if fd == 0 {
+            return Ok(());
+        }
+        let cp_len = self.checkpoint.as_ref().map(|c| c.len).unwrap_or(0);
+        // Only advance in chunks (amortized), and never into the unfinalized tail.
+        if self.executed.len() < cp_len + 2 * fd {
+            return Ok(());
+        }
+        let target = self.executed.len() - fd;
+        if target <= cp_len {
+            return Ok(());
+        }
+
+        let bank = self.open_bank(&self.checkpoint_dir, self.checkpoint.is_none())?;
+        if let Some(cp) = &self.checkpoint {
+            bank.accounts()
+                .commit(cp.accounts.iter().cloned())
+                .map_err(|e| BankError::Storage(e.to_string()))?;
+            self.replay_blocks(&bank, &self.executed[cp_len..target])?;
+        } else {
+            self.replay_blocks(&bank, &self.executed[..target])?;
+        }
+        let accounts = bank.accounts().dump().map_err(|e| BankError::Storage(e.to_string()))?;
+        let last_id = self.executed[target - 1];
+        self.checkpoint = Some(Checkpoint { len: target, last_id, accounts });
+        Ok(())
     }
 
     /// Reconstruct a stored block by id (for serving peer backfill requests),
@@ -648,6 +732,63 @@ mod tests {
         check(&mut chain); // may reorg the recent order ⇒ fallback
         chain.mine(&[transfer(&a, &b.pubkey(), 3_000_000)]).unwrap();
         check(&mut chain);
+    }
+
+    #[test]
+    fn checkpoint_rebuild_matches_full_replay() {
+        // With checkpointing on (small finality depth), build a chain, then cause
+        // a reorg *after* the checkpoint (a sibling of a recent block). The reorg
+        // rebuild must run from the checkpoint and still equal the authoritative
+        // full replay from genesis.
+        let payer = solana_keypair::Keypair::new();
+        let a = solana_keypair::Keypair::new();
+        let miner = Pubkey::new_unique();
+        let mut chain = DagChain::open(
+            dir("ckpt"),
+            3,
+            easy_target(),
+            miner,
+            1_000_000,
+            vec![(payer.pubkey(), 1_000_000_000)],
+        )
+        .unwrap();
+        chain.set_finality_depth(2);
+
+        let mut mined = Vec::new();
+        for i in 0..12 {
+            let txs = if i == 0 {
+                vec![transfer(&payer, &a.pubkey(), 100_000_000)]
+            } else {
+                vec![]
+            };
+            mined.push(chain.mine(&txs).unwrap());
+            chain.virtual_state().unwrap(); // advance executed + checkpoint
+        }
+        assert!(chain.checkpoint.is_some(), "a finalized checkpoint formed");
+        let cp_len = chain.checkpoint.as_ref().unwrap().len;
+
+        // Build a sibling of a recent (post-checkpoint) block → reorders the tail.
+        let parent = mined[mined.len() - 3].id();
+        let target = chain.expected_target(&[parent]);
+        let mut h = DagBlockHeader {
+            version: HEADER_VERSION,
+            parents: vec![parent],
+            timestamp: 9_000_000,
+            tx_merkle_root: tx_merkle_root(&[]).to_bytes(),
+            target,
+            nonce: 0,
+            miner: miner.to_bytes(),
+        };
+        while !meets_target(&h.id(), &target) {
+            h.nonce = h.nonce.wrapping_add(1);
+        }
+        chain.accept(DagBlock { header: h, transactions: vec![] }).unwrap();
+
+        // The checkpoint prefix is untouched, so the rebuild runs from it.
+        assert_eq!(chain.checkpoint.as_ref().unwrap().len, cp_len, "checkpoint unchanged");
+        let v = chain.virtual_state().unwrap().state_root().unwrap();
+        let r = chain.rebuild_state().unwrap().state_root().unwrap();
+        assert_eq!(v, r, "checkpoint-based rebuild equals full replay");
     }
 
     #[test]

@@ -88,6 +88,20 @@ impl AccountsDb {
         Ok(*hasher.finalize().as_bytes())
     }
 
+    /// Dump every account as (pubkey, account) pairs — for snapshotting state
+    /// (e.g. a finalized checkpoint) so it can be restored without re-executing
+    /// history.
+    pub fn dump(&self) -> Result<Vec<(Pubkey, AccountSharedData)>> {
+        let mut out = Vec::new();
+        for item in self.db.iterator(IteratorMode::Start) {
+            let (k, v) = item.map_err(storage_err)?;
+            let key = Pubkey::try_from(k.as_ref()).map_err(|_| storage_err("bad pubkey key"))?;
+            let account: AccountSharedData = bincode::deserialize(&v).map_err(ser_err)?;
+            out.push((key, account));
+        }
+        Ok(out)
+    }
+
     /// Number of stored accounts.
     pub fn len(&self) -> Result<usize> {
         let mut n = 0;

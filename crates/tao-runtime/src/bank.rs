@@ -238,6 +238,11 @@ impl Bank {
         self.db.state_root().map_err(|e| BankError::Storage(e.to_string()))
     }
 
+    /// The underlying account store (for snapshotting / state queries).
+    pub fn accounts(&self) -> &AccountsDb {
+        &self.db
+    }
+
     fn build_check_result(
         &self,
         sanitized: &SanitizedTransaction,
