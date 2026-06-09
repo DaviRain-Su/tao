@@ -25,4 +25,4 @@ pub use difficulty::{next_target, DifficultyParams};
 pub use genesis::genesis_header;
 pub use mine::{grind, GrindResult};
 pub use pow::{Blake3Pow, HeightSwitchPow, PowAlgorithm};
-pub use target::{meets_target, work_for_target, Target};
+pub use target::{meets_target, pow_level, work_for_target, Target};

@@ -40,6 +40,34 @@ pub fn work_for_target(target: &Target) -> U256 {
     numerator / denom + U256::one()
 }
 
+/// Number of leading zero bits of a 256-bit big-endian value.
+fn leading_zero_bits(x: &[u8; 32]) -> u32 {
+    let mut z = 0u32;
+    for b in x {
+        if *b == 0 {
+            z += 8;
+        } else {
+            z += b.leading_zeros();
+            break;
+        }
+    }
+    z
+}
+
+/// The PoW **level** of a solved block: how many times harder its actual PoW hash
+/// is than the required target, as a power of two. `level = k` means
+/// `hash <= target / 2^k`, i.e. the hash cleared `k` more leading zero bits than
+/// the target demanded — a 2^k-rarer event.
+///
+/// This is the building block of succinct PoW proofs (NiPoPoW / Kaspa's pruning
+/// proof): high-level blocks are rare and sample the chain's accumulated work, so
+/// a short chain of them certifies a lot of work without the full history.
+///
+/// Assumes `hash <= target` (a valid solution); returns 0 otherwise.
+pub fn pow_level(pow_hash: &[u8; 32], target: &Target) -> u32 {
+    leading_zero_bits(pow_hash).saturating_sub(leading_zero_bits(target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +105,32 @@ mod tests {
         let hard =
             target_from_hex("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         assert!(work_for_target(&hard) > work_for_target(&easy));
+    }
+
+    #[test]
+    fn pow_level_counts_extra_zero_bits() {
+        // target allows hashes < 2^248 (one leading zero byte).
+        let target =
+            target_from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        // A hash that just meets the target → level 0.
+        let at_target =
+            target_from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert_eq!(pow_level(&at_target, &target), 0);
+        // One extra zero byte (8 more leading zero bits) → level 8.
+        let harder =
+            target_from_hex("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert_eq!(pow_level(&harder, &target), 8);
+        // All-zero hash is maximally rare.
+        assert_eq!(pow_level(&[0u8; 32], &target), 256 - 8);
+    }
+
+    #[test]
+    fn pow_level_is_one_for_double_difficulty() {
+        let target =
+            target_from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        // 0x007f.. has one more leading zero bit than 0x00ff.. → level 1.
+        let one_bit_harder =
+            target_from_hex("007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert_eq!(pow_level(&one_bit_harder, &target), 1);
     }
 }

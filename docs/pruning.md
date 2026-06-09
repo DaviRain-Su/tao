@@ -59,11 +59,40 @@ with `P` the deepest selected-chain block satisfying it.
 - **INV3 (difficulty):** with a full retained window, `next_target` / the
   enforced `expected_target` after a prune equals a non-pruned chain's — no fork.
 
-## Deliberately deferred
+## Persistence & sync (done)
 
-- **Durable log compaction.** `dag.log` still holds full history; a restart
-  replays it and rebuilds un-pruned. Compacting it to start from a snapshot record
-  is mechanical follow-on.
-- **Serving sync from the pruning point.** A pruned node can't serve from-genesis
-  joiners; it would ship the base snapshot + post-`P` blocks (Kaspa pruning-proof
-  analogue). Not yet implemented.
+- **Durable log compaction.** On prune, `dag.log` is atomically rewritten as
+  `[Snapshot(origin header + base accounts), Block(kept suffix)…]`
+  (`BlockLog::replace_all`), so a restart replays the snapshot + suffix and
+  reproduces the pruned chain — it does not un-prune. `LogRecord` tags each
+  record; `apply` remaps pruned-ancestor parent references to the origin.
+- **Serving sync from the pruning point.** A pruned node ships `SyncSnapshot`
+  { origin header, base account set, kept suffix } via `NetMsg::GetSnapshot` /
+  `Snapshot`. A fresh/behind node adopts it (`import_snapshot`): re-anchor +
+  apply the trusted suffix + write a compacted log. `dag-run` requests a snapshot
+  when block backfill stalls on pruned ancestors.
+
+## Remaining gap to full Kaspa parity: the trustless pruning proof
+
+The shipped snapshot is currently *trusted* (adopted like a checkpoint). Kaspa
+makes it trustless with a PoW **pruning-point proof** (a NiPoPoW): a succinct set
+of headers that certifies the pruning point lies on the most-work chain, without
+the pruned history. The foundation — the **block level** (`pow_level`, how many
+extra zero bits a PoW hash cleared, so a 2^level-rarer event) — is implemented.
+Completing the proof is a focused, security-critical milestone:
+
+1. **Interlinks (header change).** Each header commits to an `interlink` vector:
+   `interlink[k]` = the most recent selected ancestor of level ≥ k. Computed at
+   mine time from the selected parent: `new = sp.interlink` with `interlink[k] =
+   sp` for all `k ≤ level(sp)`. PoW commits to it (so it can't be forged), and
+   `accept` must re-derive and validate it (else the proof is unsound).
+2. **Proof construction (retained before pruning).** Walk interlinks at the
+   highest level μ that still has ≥ m blocks from genesis to P, collecting those
+   headers — `O(m·log(work))` headers, small enough to retain after pruning.
+3. **Verification.** A syncing node checks each proof header's PoW and level, that
+   they form an interlink-connected chain genesis→P, and accepts the proof with
+   the most accumulated work (NiPoPoW "most-work" rule) — then adopts that P's
+   snapshot. This replaces the trusted-suffix application with a verified one.
+
+This touches the header, the mining path, and `accept` validation, so it is left
+as a dedicated step rather than folded into the pruning work above.
