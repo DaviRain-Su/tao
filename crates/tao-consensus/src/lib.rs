@@ -22,5 +22,5 @@ pub use chain::{BlockStatus, ChainError, ChainState};
 pub use difficulty::{next_target, DifficultyParams};
 pub use genesis::genesis_header;
 pub use mine::{grind, GrindResult};
-pub use pow::{Blake3Pow, PowAlgorithm};
+pub use pow::{Blake3Pow, HeightSwitchPow, PowAlgorithm};
 pub use target::{meets_target, work_for_target, Target};

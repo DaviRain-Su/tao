@@ -15,6 +15,8 @@ mod blake3pow;
 
 pub use blake3pow::Blake3Pow;
 
+use std::sync::Arc;
+
 use crate::block::BlockHeader;
 use crate::target::meets_target;
 
@@ -29,5 +31,49 @@ pub trait PowAlgorithm: Send + Sync {
     /// Verify the header's PoW hash meets its committed target.
     fn verify(&self, header: &BlockHeader) -> bool {
         meets_target(&self.pow_hash(header), &header.target)
+    }
+}
+
+/// Switch PoW algorithms at a predetermined block height (a hard fork).
+///
+/// This is the mining-hardware evolution mechanism: e.g. RandomX (CPU fair
+/// launch) below `activation_height`, then matmul-PoUW (GPU, AI-shaped) at and
+/// above it. At the switch a chain should also reset difficulty and add a
+/// checkpoint to survive the low-difficulty window (see the plan).
+pub struct HeightSwitchPow {
+    before: Arc<dyn PowAlgorithm>,
+    after: Arc<dyn PowAlgorithm>,
+    activation_height: u64,
+}
+
+impl HeightSwitchPow {
+    pub fn new(
+        before: Arc<dyn PowAlgorithm>,
+        after: Arc<dyn PowAlgorithm>,
+        activation_height: u64,
+    ) -> Self {
+        Self { before, after, activation_height }
+    }
+
+    fn active(&self, height: u64) -> &Arc<dyn PowAlgorithm> {
+        if height >= self.activation_height {
+            &self.after
+        } else {
+            &self.before
+        }
+    }
+}
+
+impl PowAlgorithm for HeightSwitchPow {
+    fn name(&self) -> &'static str {
+        "height-switch"
+    }
+
+    fn pow_hash(&self, header: &BlockHeader) -> [u8; 32] {
+        self.active(header.height).pow_hash(header)
+    }
+
+    fn verify(&self, header: &BlockHeader) -> bool {
+        self.active(header.height).verify(header)
     }
 }

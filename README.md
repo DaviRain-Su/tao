@@ -122,10 +122,19 @@ tao airdrop $(tao address -k wallet.json) 2000000000
 tao balance $(tao address -k wallet.json)
 ```
 
-**All seven milestones (M0–M6) are complete.** Future work (per `docs/PLAN.md`):
-M7 — matmul-PoUW (AI-shaped GPU PoW with ZK verification, à la Pearl); M8 —
-blockDAG/GHOSTDAG consensus upgrade. Networking hardening (libp2p, IBD,
-multi-miner reorgs) and a real RandomX CPU phase also remain.
+- **M7 — matmul-PoUW (AI-shaped PoW) — prototype ✓** `tao-pouw::MatmulPow`
+  implements the `PowAlgorithm` trait with a NoisyGEMM-style puzzle: low-rank
+  noise is added to seed-derived matrices, the noised product is computed
+  (`O(n³)` integer matmul — the work), and a transcript hash is checked against
+  the target. `HeightSwitchPow` activates a new algorithm at a fork height. A
+  test mines a real chain across a **Blake3 → matmul-PoUW switch**, the
+  RandomX→GPU evolution mechanism. *Prototype = CPU integer matmul, verified by
+  recomputation.* Production (future) adds GPU CUDA kernels, Plonky2 STARK
+  proofs (cheap verify), and a utility gate binding the work to a real model.
+
+**M0–M6 complete; M7 prototyped.** Remaining (per `docs/PLAN.md`): M7
+production (GPU + ZK + utility gate), M8 — blockDAG/GHOSTDAG; plus networking
+hardening (libp2p, IBD, multi-miner reorgs) and a real RandomX CPU phase.
 
 ## License
 

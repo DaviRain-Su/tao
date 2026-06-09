@@ -4008,6 +4008,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tao-pouw"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "tao-consensus",
+ "tao-core",
+]
+
+[[package]]
 name = "tao-rpc"
 version = "0.1.0"
 dependencies = [
