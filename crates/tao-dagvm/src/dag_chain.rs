@@ -51,10 +51,14 @@ pub struct DagChain {
     block_time_secs: u64,
     /// LWMA window in blocks (`u64::MAX` ⇒ difficulty held fixed).
     lwma_window: u64,
+    k: u16,
     miner: Pubkey,
     reward: u64,
     accounts_dir: PathBuf,
     allocations: Vec<(Pubkey, u64)>,
+    /// After a re-anchor prune, the post-prune genesis state (full accounts),
+    /// replacing `allocations` as the base for state rebuilds.
+    base_accounts: Option<Vec<(Pubkey, AccountSharedData)>>,
     /// Cached "virtual" state and the exact block order it reflects, for
     /// incremental replay (append-only fast path; reorg ⇒ rebuild from the
     /// finalized checkpoint, or genesis if none).
@@ -141,10 +145,12 @@ impl DagChain {
             genesis_target,
             block_time_secs,
             lwma_window,
+            k,
             miner,
             reward,
             accounts_dir: data_dir.join("accounts"),
             allocations,
+            base_accounts: None,
             state: None,
             state_dir: data_dir.join("state"),
             executed: Vec::new(),
@@ -333,10 +339,15 @@ impl DagChain {
         let _ = std::fs::remove_dir_all(dir);
         let db = Arc::new(AccountsDb::open(dir).map_err(|e| BankError::Storage(e.to_string()))?);
         if seed_genesis {
-            let system = solana_sdk_ids::system_program::id();
-            for (pubkey, lamports) in &self.allocations {
-                db.set(pubkey, &AccountSharedData::new(*lamports, 0, &system))
-                    .map_err(|e| BankError::Storage(e.to_string()))?;
+            if let Some(base) = &self.base_accounts {
+                // Post-prune: the genesis state is the re-anchor snapshot.
+                db.commit(base.iter().cloned()).map_err(|e| BankError::Storage(e.to_string()))?;
+            } else {
+                let system = solana_sdk_ids::system_program::id();
+                for (pubkey, lamports) in &self.allocations {
+                    db.set(pubkey, &AccountSharedData::new(*lamports, 0, &system))
+                        .map_err(|e| BankError::Storage(e.to_string()))?;
+                }
             }
         }
         Ok(Bank::new(db, 0))
@@ -372,7 +383,9 @@ impl DagChain {
     /// always correct (used by [`Self::virtual_state`] as its reorg fallback and
     /// as the cross-check in tests).
     pub fn rebuild_state(&self) -> Result<Bank, BankError> {
-        if self.history_pruned {
+        if self.history_pruned && self.base_accounts.is_none() {
+            // Transaction bodies were dropped but there is no re-anchor base to
+            // start from, so a full replay is impossible — use virtual_state.
             return Err(BankError::Storage(
                 "history pruned; query state via virtual_state".into(),
             ));
@@ -417,7 +430,7 @@ impl DagChain {
                     .map_err(|e| BankError::Storage(e.to_string()))?;
                 self.replay_blocks(&bank, &order[cp_len..])?;
                 bank
-            } else if self.history_pruned {
+            } else if self.history_pruned && self.base_accounts.is_none() {
                 // No matching checkpoint and history is gone — a reorg deeper
                 // than the pruned/finalized point, which must never happen.
                 return Err(BankError::Storage(
@@ -508,6 +521,82 @@ impl DagChain {
     /// Whether finalized transaction history has been pruned.
     pub fn is_history_pruned(&self) -> bool {
         self.history_pruned
+    }
+
+    /// Re-anchor the DAG at a finalized pruning point, discarding its entire past
+    /// (headers + GHOSTDAG/reachability data, not only transaction bodies). The
+    /// pruning point becomes the new origin and its account set the new genesis
+    /// state. Returns the number of blocks pruned (0 if not deep enough). See
+    /// `docs/pruning.md`.
+    pub fn prune(&mut self) -> Result<usize, BankError> {
+        let order = self.total_order(); // order[0] == current origin
+        let n = order.len();
+        // Retain at least an LWMA window + finality margin behind the tip so that
+        // every new block's difficulty window stays within retained blocks (no
+        // divergence from non-pruned peers).
+        let retain = (self.lwma_window.saturating_add(self.finality_depth)) as usize;
+        if n <= retain.saturating_add(1) {
+            return Ok(0);
+        }
+        let cutoff = n - retain;
+
+        // The selected chain (tip → current origin): the pruning point must lie
+        // on it so the pruned prefix is exactly `past(P) ∪ {P}`.
+        let mut on_selected_chain = HashSet::new();
+        {
+            let mut cur = self.engine.tip();
+            loop {
+                on_selected_chain.insert(cur.to_bytes());
+                if cur == self.genesis_dag {
+                    break;
+                }
+                cur = self.engine.selected_parent(cur);
+            }
+        }
+        // Deepest selected-chain block at index ≤ cutoff (and past the origin).
+        let p_idx = match (1..=cutoff.min(n - 1)).rev().find(|&i| on_selected_chain.contains(&order[i])) {
+            Some(i) => i,
+            None => return Ok(0),
+        };
+        let p = order[p_idx];
+        let p_dag = DagHash::from_bytes(p);
+
+        // Base state = account set after executing the pruned prefix (order[..=p_idx]).
+        // Built from the current base/genesis, replaying only up to P (bounded).
+        let base_bank = self.open_bank(&self.checkpoint_dir, true)?;
+        self.replay_blocks(&base_bank, &order[..=p_idx])?; // order[0] == current origin, skipped
+        let new_base = base_bank.accounts().dump().map_err(|e| BankError::Storage(e.to_string()))?;
+
+        // Rebuild the engine with P as genesis; re-add the kept suffix.
+        let kept: HashSet<[u8; 32]> = order[p_idx..].iter().copied().collect();
+        let engine = DagEngine::new(self.k, p_dag);
+        engine.add_block(p_dag, &[blockhash::ORIGIN]);
+        for id in &order[p_idx + 1..] {
+            let header = self.headers.get(id).expect("kept block has a header");
+            let mut parents: Vec<DagHash> = header
+                .parents
+                .iter()
+                .map(|pp| if kept.contains(pp) { DagHash::from_bytes(*pp) } else { p_dag })
+                .collect();
+            parents.sort_by(|a, b| a.to_bytes().cmp(&b.to_bytes()));
+            parents.dedup();
+            engine.add_block(DagHash::from_bytes(*id), &parents);
+        }
+
+        let pruned_count = self.blocks.len().saturating_sub(kept.len());
+
+        // Swap in the re-anchored state.
+        self.engine = engine;
+        self.genesis_dag = p_dag;
+        self.base_accounts = Some(new_base);
+        self.history_pruned = true;
+        self.checkpoint = None;
+        self.headers.retain(|id, _| kept.contains(id));
+        self.block_txs.retain(|id, _| kept.contains(id) && *id != p);
+        self.blocks = kept;
+        self.state = None;
+        self.executed.clear();
+        Ok(pruned_count)
     }
 
     /// Reconstruct a stored block by id (for serving peer backfill requests),
@@ -855,6 +944,111 @@ mod tests {
         // But the snapshot-based virtual state still reproduces the same root.
         let after = chain.virtual_state().unwrap().state_root().unwrap();
         assert_eq!(before, after, "state preserved after pruning finalized tx bodies");
+    }
+
+    #[test]
+    fn reanchor_prune_preserves_state_and_order() {
+        // Re-anchoring at a finalized pruning point must preserve both the state
+        // (INV1) and the post-pruning-point order (INV2). Uses DAA mode with a
+        // small window so the prune triggers; on-time spacing keeps difficulty at
+        // the easy genesis target (fast grind).
+        let payer = solana_keypair::Keypair::new();
+        let a = solana_keypair::Keypair::new();
+        let miner = Pubkey::new_unique();
+        let mut chain = DagChain::open_with_daa(
+            dir("reanchor"),
+            3,
+            easy_target(),
+            miner,
+            1_000_000,
+            vec![(payer.pubkey(), 1_000_000_000)],
+            10,
+            5,
+        )
+        .unwrap();
+        chain.set_finality_depth(2);
+
+        let mut ts = 1_000_000i64;
+        for i in 0..24 {
+            let txs = if i < 3 {
+                vec![transfer(&payer, &a.pubkey(), 20_000_000)]
+            } else {
+                vec![]
+            };
+            chain.mine_at(&txs, ts).unwrap();
+            ts += 10; // on time → difficulty holds easy
+            chain.virtual_state().unwrap();
+        }
+
+        let pre_root = chain.virtual_state().unwrap().state_root().unwrap();
+        let pre_order = chain.total_order();
+        let pre_blocks = chain.block_count();
+
+        let pruned = chain.prune().unwrap();
+        assert!(pruned > 0, "re-anchor pruned some blocks");
+        assert!(chain.is_history_pruned());
+        assert!(chain.block_count() < pre_blocks, "fewer blocks retained");
+
+        // INV1: state preserved.
+        let post_root = chain.virtual_state().unwrap().state_root().unwrap();
+        assert_eq!(pre_root, post_root, "INV1: state preserved across re-anchor");
+        // rebuild_state (now base-seeded) also reproduces it.
+        assert_eq!(
+            chain.rebuild_state().unwrap().state_root().unwrap(),
+            pre_root,
+            "rebuild from re-anchor base matches"
+        );
+
+        // INV2: the new order is exactly the old order from the pruning point on.
+        let post_order = chain.total_order();
+        let p = post_order[0];
+        let p_idx = pre_order.iter().position(|x| *x == p).expect("P present in pre-order");
+        assert_eq!(post_order.as_slice(), &pre_order[p_idx..], "INV2: order suffix preserved");
+
+        // The chain still works after pruning: mine more, state stays consistent.
+        chain.mine_at(&[transfer(&payer, &a.pubkey(), 1_000_000)], ts).unwrap();
+        let r1 = chain.virtual_state().unwrap().state_root().unwrap();
+        let r2 = chain.rebuild_state().unwrap().state_root().unwrap();
+        assert_eq!(r1, r2, "post-prune mining keeps virtual == rebuild");
+    }
+
+    #[test]
+    fn reanchor_preserves_difficulty_window() {
+        // INV3: a pruned node and a non-pruned node compute the SAME next target
+        // (the prune retained a full LWMA window), so they cannot diverge.
+        let miner = Pubkey::new_unique();
+        let build = |tag: &str| {
+            let mut c = DagChain::open_with_daa(
+                dir(tag),
+                3,
+                easy_target(),
+                miner,
+                0,
+                vec![],
+                10,
+                5,
+            )
+            .unwrap();
+            c.set_finality_depth(2);
+            let mut ts = 500_000i64;
+            for _ in 0..24 {
+                c.mine_at(&[], ts).unwrap();
+                ts += 10;
+            }
+            c
+        };
+        let mut pruned = build("daawin-a");
+        let intact = build("daawin-b");
+        // Identical mining sequences ⇒ identical chains ⇒ identical next target.
+        assert_eq!(pruned.next_target(), intact.next_target(), "sanity: chains identical");
+
+        pruned.prune().unwrap();
+        assert!(pruned.is_history_pruned());
+        assert_eq!(
+            pruned.next_target(),
+            intact.next_target(),
+            "INV3: pruned node computes the same difficulty as a non-pruned peer"
+        );
     }
 
     #[test]

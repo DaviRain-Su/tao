@@ -317,13 +317,14 @@ fn dag_run(
             last_tipreq = Instant::now();
         }
 
-        // Maintenance: advance the virtual state (forming checkpoints) and prune
-        // finalized transaction bodies to bound memory.
+        // Maintenance: advance the virtual state (forming checkpoints), then
+        // re-anchor at a finalized pruning point to bound memory (headers +
+        // GHOSTDAG data + tx bodies). No-op until the chain is deep enough.
         if last_maint.elapsed() >= Duration::from_secs(5) {
             let _ = chain.virtual_state();
-            if let Ok(n) = chain.prune_finalized_transactions() {
+            if let Ok(n) = chain.prune() {
                 if n > 0 {
-                    tracing::info!(pruned = n, "pruned finalized tx bodies");
+                    tracing::info!(pruned = n, blocks = chain.block_count(), "re-anchored / pruned");
                 }
             }
             last_maint = Instant::now();
