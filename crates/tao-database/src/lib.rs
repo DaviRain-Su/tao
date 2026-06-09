@@ -8,6 +8,8 @@
 //! A columnar RocksDB store (for the account state DB and indexed lookups)
 //! lands in **M2**, where mutable account state makes it worth the dependency.
 
+mod accounts_db;
 mod block_log;
 
+pub use accounts_db::AccountsDb;
 pub use block_log::BlockLog;

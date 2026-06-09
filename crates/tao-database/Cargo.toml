@@ -10,3 +10,8 @@ description = "Durable persistence for chain and account state"
 [dependencies]
 tao-core.workspace = true
 tracing.workspace = true
+rocksdb.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+solana-pubkey.workspace = true
+solana-account.workspace = true

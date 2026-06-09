@@ -9,3 +9,10 @@ description = "Bank layer: AccountsDB plus solana-svm transaction execution"
 
 [dependencies]
 tao-core.workspace = true
+tao-database.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+solana-pubkey.workspace = true
+solana-account.workspace = true
+solana-hash.workspace = true
+solana-sdk-ids.workspace = true

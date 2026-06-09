@@ -49,9 +49,17 @@ tokio = { version = "1", features = ["full"] }
 # ---- process ----
 ctrlc = { version = "3", features = ["termination"] }
 
+# ---- storage ----
+rocksdb = "0.24"
+
 # ---- solana ecosystem (compat layer) ----
-solana-pubkey = { version = "=4.2.0", features = ["serde"] }
-solana-hash = { version = "=4.0.1", features = ["serde"] }
+# Versions pinned to solana-svm 4.0.0's dependency tree (see docs/svm-integration-4.0.md):
+# svm 4.0 itself is 4.x but depends on the 3.x line of account/transaction/message.
+# Mixing 4.x of those would create duplicate incompatible AccountSharedData types.
+solana-pubkey = { version = "=4.1.0", features = ["serde"] }
+solana-hash = { version = "=4.2.0", features = ["serde"] }
+solana-account = { version = "=3.4.0", features = ["serde"] }
+solana-sdk-ids = "=3.1.0"
 
 [profile.release]
 opt-level = 3
